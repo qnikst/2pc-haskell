@@ -87,7 +87,7 @@ data TClientInfo a = TClientInfo
       { tclientState :: TState                                -- ^ transaction state
       , tcommit      :: TCommit                               -- ^ commit action
       , trollback    :: TRollback                             -- ^ rollback action
-      , tcsender     :: (Addr a)
+      , tcsender     :: Addr a
       }
 
 -- | UI Events
@@ -108,17 +108,17 @@ data ServerAction = ServerCommit
 
 withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Show (Addr a))
           => a 
-          -> (Addr a) 
+          -> Addr a
           -> ByteString 
-          -> (Addr a) 
+          -> Addr a
           -> (Event ByteString -> IO (Maybe Action)) 
           -> IO ()
 withInput _ s _ r _ | trace (show s ++"-->" ++ show r) False = undefined
 withInput a s b r f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
     in case ev of
-         Fail _ _ _  -> return () -- TODO log?
-         Partial _   -> return () -- TODO log?
+         Fail{}    -> return () -- TODO log?
+         Partial{} -> return () -- TODO log?
          Done _ _  v -> go v
   where
     st = storageCohort . getStore $ a
@@ -138,14 +138,14 @@ withInput a s b r f =
         mv <- atomically $ M.lookup t <$> readTVar (storageCohort . getStore $ a)
         case mv of
           Nothing -> reply r (PAck t (Left "transaction-expired"))
-          Just info -> do
+          Just info -> 
             case tclientState info of
               TVote -> do
                 let info' = info {tclientState = TCommiting}
                 -- TODO: update persistent storage
                 atomically $ modifyTVar st (M.insert t info')
                 (x, s') <- either (\e -> (PAck t . Left . S8.pack $ show e, TRollback))
-                                  (\_ -> (PAck t $ Right (), TCommited))
+                                  (const (PAck t $ Right (), TCommited))
                                   <$> trySome (tcommit info)
                 -- TODO: update persistent storage
                 atomically $ modifyTVar st
@@ -159,23 +159,23 @@ withInput a s b r f =
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
-          Nothing -> void . trySome . f $ (EventRollback t)
+          Nothing -> void . trySome . f $ EventRollback t
           Just info -> do
             case tclientState info of
               TCommited  -> do
                   atomically $ modifyTVar st (M.insert t info{tclientState=TRollingback})
                   ret <- trySome $ trollback info
                   case ret of
-                    Left ex -> void . trySome . f $ (EventRollbackE t ex)
+                    Left ex -> void . trySome . f $ EventRollbackE t ex
                     Right _ -> return ()
               TCommiting -> return () {- ? -}
               _ -> return ()
             atomically $ modifyTVar st (M.delete t)
-    go (PAck t x) = atomically (M.lookup t <$> (readTVar ct)) >>= \xv ->
+    go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
         Nothing -> reply r (PRollback t) -- send a r (encode' (PRollback t )) s
         Just info -> 
-          let aw = s `S.delete` (tawait info)
+          let aw = s `S.delete` tawait info
               ps = tparty info
               rs = tresult info
               (ok,rs') = case x of 
@@ -211,7 +211,7 @@ withInput a s b r f =
 
 
             
-register :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> (Addr a) -> d -> [(Addr a)] -> IO TID
+register :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> Addr a -> d -> [Addr a] -> IO TID
 register a s d rs = do
     tid <- generateTID
     box <- newEmptyTMVarIO
