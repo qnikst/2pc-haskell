@@ -1,5 +1,16 @@
 {-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings #-}
-module Network.TwoPhase where
+module Network.TwoPhase 
+  ( TPNetwork(..)
+  , TPStorage(..)
+  , withInput
+  , Action(..)
+  , Storage(..)
+  , Event(..)
+  -- ** functions
+  , register
+  , waitResult
+  , toEvent
+  ) where
 
 import Prelude hiding (sequence, mapM_)
 import Control.Applicative
@@ -19,8 +30,6 @@ import Data.Set (Set)
 import qualified Data.Set as S
 import qualified System.Random.MWC as MWC
 
-import Debug.Trace
-
 -- | TNetwork class abstracts network logic and
 -- need to be defined to bind ThoPhase controller 
 -- to the real network and can be sent over arbitrary
@@ -28,7 +37,6 @@ import Debug.Trace
 class TPNetwork a where
   type Addr a
   send :: a -> Addr a -> ByteString -> Addr a -> IO ()
-
 
 -- | Simple protocol
 data Protocol = PNewTransaction TID ByteString                                      -- ^ new transaction message
@@ -64,8 +72,7 @@ data Storage a = Storage
 
 type TRollback = IO ()
 type TCommit   = IO ()
-
-
+type TEvent  a = Event a -> IO (Maybe Action)
 
 -- | Transaction state
 data TState = TVote
@@ -99,21 +106,14 @@ data Event b = EventNew b                            -- ^ new transaction receiv
 data Action = Decline ByteString
             | Accept  TCommit TRollback
 
-{-
--- | Controller events
-data ServerAction = ServerCommit
-                  | ServerRollback
--}
-
 
 withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Show (Addr a))
           => a 
           -> Addr a
           -> ByteString 
           -> Addr a
-          -> (Event ByteString -> IO (Maybe Action)) 
+          -> TEvent ByteString
           -> IO ()
-withInput _ s _ r _ | trace (show s ++"-->" ++ show r) False = undefined
 withInput a s b r f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
     in case ev of
@@ -124,7 +124,6 @@ withInput a s b r f =
     st = storageCohort . getStore $ a
     ct = storageLeader . getStore $ a
     reply r' b' = send a r' (encode' b') s
-    go x | trace (show x) False = undefined
     go (PNewTransaction t b1) = do
         ev <- hack <$> (try . f $! EventNew b1)
         case ev of
@@ -182,7 +181,6 @@ withInput a s b r f =
                            Left  e -> (False,e:rs)
                            Right _ -> (True,rs)
           in case tstate info of
-              TVote | trace (show aw) False -> undefined
               TVote | S.null aw -> let (msg,st') = if null rs' then (PCommit t, TCommiting)
                                                               else (PRollback t, TRollingback)
                                    in do atomically $ modifyTVar ct (M.insert t info{tstate=st',
@@ -232,8 +230,17 @@ waitResult a t = atomically $ do
   where st = storageLeader. getStore $ a
   
 
-hack :: Either SomeException (Maybe a) -> Maybe a
-hack (Left _) = Nothing -- Just (Decline e)
+toEvent :: (Binary b) => TEvent b -> TEvent ByteString
+toEvent f = \x -> f (fromBS x) 
+  where
+    fromBS :: (Binary b) => Event ByteString -> Event b
+    fromBS (EventNew b) = EventNew (decode' b)
+    fromBS (EventRollback t) = EventRollback t
+    fromBS (EventRollbackE t e) = EventRollbackE t e
+
+
+hack :: Either SomeException (Maybe Action) -> Maybe Action
+hack (Left e) = Just (Decline . S8.pack $! show e)
 hack (Right Nothing) = Nothing
 hack (Right (Just x)) = Just x
 
@@ -248,3 +255,16 @@ generateTID :: IO ByteString
 generateTID = MWC.withSystemRandom . MWC.asGenIO $ \gen ->
                     S.pack <$> replicateM 20 (MWC.uniform gen)
 
+decode' :: (Binary b) => ByteString -> b
+decode' b = 
+  case (pushEndOfInput $ pushChunk (runGetIncremental get) b) of
+    Done _ _ v -> v
+    _ -> error "no parse"
+
+{-
+decodeMay' :: (Binary b) => ByteString -> Maybe b
+decodeMay' b = 
+  case (pushEndOfInput $ pushChunk (runGetIncremental get) b) of
+    Done _ _ v -> return v
+    _ -> fail "no parse"
+-}
