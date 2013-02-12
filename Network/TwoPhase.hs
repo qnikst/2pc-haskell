@@ -8,7 +8,7 @@ module Network.TwoPhase
   , Event(..)
   -- ** functions
   , mkStorage 
-  , register
+  , transaction
   , waitResult
   , toEvent
   ) where
@@ -214,8 +214,8 @@ withInput a s b r f =
 
 
             
-register :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> Addr a -> d -> [Addr a] -> IO TID
-register a s d rs = do
+transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO TID
+transaction a d rs = do
     tid <- generateTID
     box <- newEmptyTMVarIO
     let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] box
