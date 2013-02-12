@@ -7,6 +7,7 @@ module Network.TwoPhase
   , Storage(..)
   , Event(..)
   -- ** functions
+  , mkStorage 
   , register
   , waitResult
   , toEvent
@@ -69,6 +70,10 @@ data Storage a = Storage
         { storageLeader :: TVar (Map TID (TServerInfo a))
         , storageCohort :: TVar (Map TID (TClientInfo a))
         }
+
+mkStorage :: IO (Storage a)
+mkStorage = Storage <$> newTVarIO M.empty 
+                    <*> newTVarIO M.empty
 
 type TRollback = IO ()
 type TCommit   = IO ()
