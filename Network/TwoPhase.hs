@@ -15,7 +15,7 @@ module Network.TwoPhase
 
 import Prelude hiding (sequence, mapM_)
 import Control.Applicative
-import Control.Monad (void, forM_, replicateM)
+import Control.Monad (void, forM_, replicateM, when)
 import Control.Concurrent.STM
 import Control.Exception
 import Data.Binary
@@ -85,6 +85,7 @@ data TState = TVote
             | TRollback
             | TCommiting
             | TCommited
+            deriving (Eq, Show)
 
 data TServerInfo a = TServerInfo
       { tstate       :: TState
@@ -156,6 +157,7 @@ withInput a s b r f =
                                         (case s' of
                                            TRollback -> M.delete t
                                            o -> M.insert t (info'{tclientState = o}))
+                when (s' == TRollback) (trollback info)
                 reply x
               TCommited  -> reply $ PAck t (Right ())
               TCommiting -> return () {- ? -}
