@@ -12,25 +12,26 @@ import Network.TwoPhase
 
 type Message = (Addr STMNetwork, ByteString, Addr STMNetwork)
 
-data STMNetwork = STMNetwork (Map ByteString (TChan Message)) (Storage STMNetwork)
+data STMNetwork = STMNetwork (ByteString) (Map ByteString (TChan Message)) (Storage STMNetwork)
 
 instance TPNetwork STMNetwork where
   type Addr STMNetwork = ByteString
-  send (STMNetwork s _) from m to = 
+  send (STMNetwork from s _) m to = 
     case M.lookup to s of
       Nothing -> return ()
       Just x -> atomically $ writeTChan x (from,m,to)
+
 instance TPStorage STMNetwork where
-  getStore (STMNetwork _ s) = s  
+  getStore (STMNetwork _ _ s) = s  
 
-mkNetwork :: [ByteString] -> IO STMNetwork
-mkNetwork bs = STMNetwork <$> (M.fromList <$> mapM (\x -> (,) x <$> newTChanIO) bs)
-                          <*> (Storage <$> newTVarIO M.empty
-                                       <*> newTVarIO M.empty)
+mkNetwork :: ByteString -> [ByteString] -> IO STMNetwork
+mkNetwork n bs = STMNetwork n <$> (M.fromList <$> mapM (\x -> (,) x <$> newTChanIO) bs)
+                              <*> (Storage <$> newTVarIO M.empty
+                                           <*> newTVarIO M.empty)
 
-cloneNetwork :: STMNetwork -> IO STMNetwork
-cloneNetwork (STMNetwork a _) = STMNetwork a <$> (Storage <$> newTVarIO M.empty
-                                                          <*> newTVarIO M.empty)
+cloneNetwork :: STMNetwork -> ByteString -> IO STMNetwork
+cloneNetwork (STMNetwork _ a _) f = STMNetwork f a <$> (Storage <$> newTVarIO M.empty
+                                                              <*> newTVarIO M.empty)
 
 extractCh :: STMNetwork -> ByteString -> Maybe (TChan Message)
-extractCh (STMNetwork a _) b = M.lookup b a
+extractCh (STMNetwork _ a _) b = M.lookup b a

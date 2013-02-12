@@ -37,7 +37,7 @@ import qualified System.Random.MWC as MWC
 -- protocol
 class TPNetwork a where
   type Addr a
-  send :: a -> Addr a -> ByteString -> Addr a -> IO ()
+  send :: a -> ByteString -> Addr a -> IO ()
 
 -- | Simple protocol
 data Protocol = PNewTransaction TID ByteString                                      -- ^ new transaction message
@@ -128,20 +128,20 @@ withInput a s b r f =
   where
     st = storageCohort . getStore $ a
     ct = storageLeader . getStore $ a
-    reply r' b' = send a r' (encode' b') s
+    reply b' = send a (encode' b') s
     go (PNewTransaction t b1) = do
         ev <- hack <$> (try . f $! EventNew b1)
         case ev of
           Nothing -> return () -- just ignore
-          Just (Decline e) -> reply r $ PAck t (Left (encode' e))
+          Just (Decline e) -> reply $ PAck t (Left (encode' e))
           Just (Accept  commit rollback) -> do
             let info = TClientInfo TVote commit rollback s
             atomically $ modifyTVar st (M.insert t info)
-            reply r $ PAck t (Right ())
+            reply $ PAck t (Right ())
     go (PCommit t) = do
         mv <- atomically $ M.lookup t <$> readTVar (storageCohort . getStore $ a)
         case mv of
-          Nothing -> reply r (PAck t (Left "transaction-expired"))
+          Nothing -> reply (PAck t (Left "transaction-expired"))
           Just info -> 
             case tclientState info of
               TVote -> do
@@ -156,10 +156,10 @@ withInput a s b r f =
                                         (case s' of
                                            TRollback -> M.delete t
                                            o -> M.insert t (info'{tclientState = o}))
-                reply r x
-              TCommited -> reply r $ PAck t (Right ())
+                reply x
+              TCommited  -> reply $ PAck t (Right ())
               TCommiting -> return () {- ? -}
-              _ -> reply r (PAck t (Left "illegal-state"))
+              _ -> reply (PAck t (Left "illegal-state"))
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
@@ -177,7 +177,7 @@ withInput a s b r f =
             atomically $ modifyTVar st (M.delete t)
     go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
-        Nothing -> reply r (PRollback t) -- send a r (encode' (PRollback t )) s
+        Nothing -> reply (PRollback t) -- send a r (encode' (PRollback t )) s
         Just info -> 
           let aw = s `S.delete` tawait info
               ps = tparty info
@@ -191,7 +191,7 @@ withInput a s b r f =
                                    in do atomically $ modifyTVar ct (M.insert t info{tstate=st',
                                                                                      tresult=rs'
                                                                                     })
-                                         mapM_ (send a r (encode' msg)) ps
+                                         mapM_ (send a (encode' msg)) ps
                     | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
                                                                               ,tresult=rs'})
               TCommiting | not ok -> let ps' = s `S.delete` ps
@@ -199,7 +199,7 @@ withInput a s b r f =
                                                                                       ,tawait=ps'
                                                                                       ,tresult=rs'
                                                                                       })
-                                           mapM_ (send a r (encode' $ PRollback t)) ps'
+                                           mapM_ (send a (encode' $ PRollback t)) ps'
                          | S.null aw -> atomically $ do
                                             modifyTVar ct (M.delete t)
                                             putTMVar (result info) (Right ())
@@ -220,7 +220,7 @@ transaction a d rs = do
     box <- newEmptyTMVarIO
     let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] box
     atomically $ modifyTVar st (M.insert tid info)
-    forM_ rs $ \r -> send a s (encode' (PNewTransaction tid db)) r
+    forM_ rs $ \r -> send a (encode' (PNewTransaction tid db)) r
     return tid
   where db = encode' d
         st = storageLeader . getStore $ a
