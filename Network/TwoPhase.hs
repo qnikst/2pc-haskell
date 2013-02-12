@@ -198,14 +198,14 @@ withInput a s b r f =
                                                                               ,tresult=rs'})
               TCommiting | not ok -> let ps' = s `S.delete` ps
                                      in if S.null ps'
-                                            then do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
+                                            then atomically $  do
+                                                modifyTVar ct (M.delete t)
+                                                putTMVar (result info) (Left rs')
+                                            else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
                                                                                       ,tawait=ps'
                                                                                       ,tresult=rs'
                                                                                       })
                                                     mapM_ (send a (encode' $ PRollback t)) ps'
-                                            else atomically $  do
-                                                modifyTVar ct (M.delete t)
-                                                putTMVar (result info) (Left rs')
                          | S.null aw -> atomically $ do
                                             modifyTVar ct (M.delete t)
                                             putTMVar (result info) (Right ())
