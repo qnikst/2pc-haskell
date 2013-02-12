@@ -1,5 +1,5 @@
 {-# LANGUAGE TypeFamilies #-}
-module Network.TwoPhase.Class 
+module Network.TwoPhase.STM
   where
 
 import Control.Applicative
