@@ -165,7 +165,8 @@ withInput a s b r f =
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
-          Nothing -> void . trySome . f $ EventRollback t
+          Nothing -> do -- void . trySome . f $ EventRollback t
+                        reply $ PAck t (Right ())
           Just info -> do
             case tclientState info of
               TCommited  -> do
@@ -198,21 +199,18 @@ withInput a s b r f =
                                                                               ,tresult=rs'})
               TCommiting | not ok -> let ps' = s `S.delete` ps
                                      in if S.null ps'
-                                            then atomically $  do
-                                                modifyTVar ct (M.delete t)
-                                                putTMVar (result info) (Left rs')
+                                            then do atomically $ putTMVar (result info) (Left rs')
+                                                    atomically $ modifyTVar ct (M.delete t)
                                             else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
                                                                                       ,tawait=ps'
                                                                                       ,tresult=rs'
                                                                                       })
                                                     mapM_ (send a (encode' $ PRollback t)) ps'
-                         | S.null aw -> atomically $ do
-                                            modifyTVar ct (M.delete t)
-                                            putTMVar (result info) (Right ())
+                         | S.null aw -> do atomically $ putTMVar (result info) (Right ())
+                                           atomically $ modifyTVar ct (M.delete t)
                          | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
-              TRollingback | S.null aw -> atomically $ do
-                                              modifyTVar ct (M.delete t)
-                                              putTMVar (result info) (Left rs')
+              TRollingback | S.null aw -> do atomically $ putTMVar (result info) (Left rs')
+                                             atomically $ modifyTVar ct (M.delete t)
                            | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
                                                                                      ,tresult=rs'})
               TCommited -> error "illegal server state"
@@ -233,11 +231,11 @@ transaction a d rs = do
 
 
 waitResult :: (TPStorage a) => a -> TID -> IO (Maybe (Either [ByteString] ()))
-waitResult a t = atomically $ do
-    mx <- M.lookup t <$> readTVar st
+waitResult a t = do 
+    mx <- atomically $ M.lookup t <$> readTVar st
     case mx of
       Nothing -> return Nothing
-      Just x  -> Just <$> readTMVar (result x)
+      Just x  -> atomically $ Just <$> readTMVar (result x)
   where st = storageLeader. getStore $ a
   
 

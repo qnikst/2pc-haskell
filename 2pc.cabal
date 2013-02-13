@@ -2,7 +2,7 @@
 -- see http://haskell.org/cabal/users-guide/
 
 name:                2pc
-version:             0.0.1
+version:             0.0.1.1
 synopsis:            protocol agnostic two phase commit implementation
 -- description:         
 license:             BSD3
