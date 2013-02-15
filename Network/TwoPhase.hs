@@ -46,6 +46,10 @@ data Protocol = PNewTransaction TID ByteString                                  
               | PAck TID (Either ByteString ())   -- ^ ack message
               deriving (Show)
 
+ackOk t = PAck t (Right ())
+ackNo t f = PAck t (Left (encode' f))
+
+
 instance Binary Protocol where
   put (PNewTransaction t b) = putWord8 0 >> put t >> put b
   put (PCommit t) = putWord8 1 >> put t
@@ -123,9 +127,8 @@ withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Show (Addr a))
 withInput a s b r f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
     in case ev of
-         Fail{}    -> return () -- TODO log?
-         Partial{} -> return () -- TODO log?
          Done _ _  v -> go v
+         _ -> return ()
   where
     st = storageCohort . getStore $ a
     ct = storageLeader . getStore $ a
@@ -134,15 +137,14 @@ withInput a s b r f =
         ev <- hack <$> (try . f $! EventNew b1)
         case ev of
           Nothing -> return () -- just ignore
-          Just (Decline e) -> reply $ PAck t (Left (encode' e))
+          Just (Decline e) -> finishClient >> reply (ackNo t e)
           Just (Accept  commit rollback) -> do
-            let info = TClientInfo TVote commit rollback s
-            atomically $ modifyTVar st (M.insert t info)
-            reply $ PAck t (Right ())
+            atomically $ modifyTVar st (M.insert t (TClientInfo TVote commit rollback s))
+            reply $! ackOk t
     go (PCommit t) = do
         mv <- atomically $ M.lookup t <$> readTVar (storageCohort . getStore $ a)
         case mv of
-          Nothing -> reply (PAck t (Left "transaction-expired"))
+          Nothing -> finishClient >> reply (PAck t (Left "transaction-expired"))
           Just info -> 
             case tclientState info of
               TVote -> do
@@ -150,23 +152,24 @@ withInput a s b r f =
                 -- TODO: update persistent storage
                 atomically $ modifyTVar st (M.insert t info')
                 (x, s') <- either (\e -> (PAck t . Left . S8.pack $ show e, TRollback))
-                                  (const (PAck t $ Right (), TCommited))
+                                  (const (ackOk t, TCommited))
                                   <$> trySome (tcommit info)
                 -- TODO: update persistent storage
                 atomically $ modifyTVar st
                                         (case s' of
                                            TRollback -> M.delete t
                                            o -> M.insert t (info'{tclientState = o}))
-                when (s' == TRollback) (trollback info)
                 reply x
-              TCommited  -> reply $ PAck t (Right ())
+                if s' == TRollback 
+                      then finishClient >> atomically (modifyTVar st (M.delete t)) >> trollback info
+                      else atomically $ modifyTVar st (M.insert t (info'{tclientState=s'}))
+              TCommited  -> reply (ackOk t)
               TCommiting -> return () {- ? -}
               _ -> reply (PAck t (Left "illegal-state"))
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
-          Nothing -> do -- void . trySome . f $ EventRollback t
-                        reply $ PAck t (Right ())
+          Nothing -> reply $ ackOk t
           Just info -> do
             case tclientState info of
               TCommited  -> do
@@ -178,6 +181,7 @@ withInput a s b r f =
               TCommiting -> return () {- ? -}
               _ -> return ()
             atomically $ modifyTVar st (M.delete t)
+            finishClient
     go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
         Nothing -> reply (PRollback t) -- send a r (encode' (PRollback t )) s
@@ -220,8 +224,6 @@ withInput a s b r f =
     finishFail t info m = atomically $ do
                            putTMVar (result info) (Left m)
                            modifyTVar ct (M.delete t)
-                              
-
 
             
 transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO TID
