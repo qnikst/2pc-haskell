@@ -25,7 +25,7 @@ instance TPStorage STMNetwork where
   getStore (STMNetwork _ _ s) = s  
 
 mkNetwork :: ByteString -> [ByteString] -> IO STMNetwork
-mkNetwork n bs = STMNetwork n <$> (M.fromList <$> mapM (\x -> (,) x <$> newTChanIO) bs)
+mkNetwork n bs = STMNetwork n <$> (M.fromList <$> mapM (\x -> (,) x <$> newTChanIO) (n:bs))
                               <*> (Storage <$> newTVarIO M.empty
                                            <*> newTVarIO M.empty)
 

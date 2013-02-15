@@ -9,67 +9,62 @@ import Test.Framework (Test, testGroup)
 import Test.Framework.Providers.HUnit (testCase)
 import Test.HUnit
 
-import Control.Monad (when)
+import Control.Monad (when, forM_)
 import Control.Concurrent.STM
 import qualified Data.Map as M
+import Data.Binary
+import qualified Data.ByteString as S
+import qualified Data.ByteString.Lazy as SL
 
 
-import Network.TwoPhase.Class
+import Network.TwoPhase.STM
 import Network.TwoPhase
 
 main :: IO ()
 main = defaultMain [tests]
 
-tests = testGroup "2pc"
-  [ testCase "case01 (register)" case01 
-  , testCase "case02 (input)" case02
---  , testCase "case03 (voting)" case03
-  ]
+tests = undefined
 
+data Description = Data { step1 :: Bool
+                        , r1 :: TVar (Maybe Bool)
+                        , step2 :: Bool
+                        , step3 :: Bool
+                        }
 
-si :: String
-si = "!"
+runState :: STMNetwork -> S.ByteString -> Description -> IO ()
+runState net n (Description s1 r1 s2 s3) = forever $ do
+    (s,m,r) <- atomically (readTChan ch)
+    withInput s m r $ \x -> 
+        case x of
+          NewEvent _ -> if s1 then accept
+                              else decline
+          _   -> error "!"
+  where
+    accept = atomically (putTVar r1 (Just True)) >> return $ Accept commit rollback
+    decline = atomically (putTVar r1 (Just False)) >> return $ Decline "!!" 
+    commit  = if s2 then atomically (putTVar r2 (Just True))
+                    else atomically (putTVar r2 (Just False))
+    rollback = if s3 then atomically (putTVar r3 (Just True))
+                  s3 then atomically (putTVar r3 (Just False))
+    
 
-case01 = do
-  net@(STMNetwork st s) <- mkNetwork ["a","b","c"]
-  tid <- register net "a" si ["b"] (\_ _ -> return ())
-  let (Just ch) = M.lookup "b" st
-  checkTChan [("a",encode' $ PNewTransaction tid (encode' si),"b")] ch
-  let (Just ch) = M.lookup "c" st
-  checkTChan [] ch
+experiment :: STMNetwork -> S.ByteString -> [Description] -> IO ()
+experiment ds = do
+    let es = zip ns ds
+    net <- mkNetwork "main" (map fst es)
+    forM_ es $ \(n,d) -> forkIO $ do
+        net' <- cloneNetwork n net
+        runState net' n d
+    t <- transaction net "!" (map first es)
+    forkIO $ do
+      case extractCh net "main" of
+        Nothing -> error "no ch"
+        Just x  -> forever $ do
+          (s,m,r) <- atomically (readTChan ch)
+          withInput net m r (const Nothing)
+      
+  where ns = [S.singleton x | x <-[0..]]
 
-case02 = do
-  net@(STMNetwork st s) <- mkNetwork ["a","b","c"]
-  tid <- register net "a" si ["b"] (\_ _ -> return ())
-  let (Just ch) = M.lookup "b" st
-  (s,m,r) <- atomically . readTChan $ ch
-  v <- newTVarIO False
-  withInput net s m r (\e -> 
-    case e of
-      EventNew b -> when (b == encode' si) (atomically $ writeTVar v True) >> return (Nothing::Maybe (Action STMNetwork ()))
-      _ -> return Nothing)
-  assertBool "correct encoded message" =<< readTVarIO v 
-  tid <- register net "a" si ["b","c"] (\_ _ -> return ())
-  v <- newTVarIO 0
-  (s,m,r) <- atomically . readTChan $ ch
-  withInput net s m r (\e -> 
-    case e of
-      EventNew b -> when (b == encode' si) (atomically $ modifyTVar v (+1)) >> return (Nothing::Maybe (Action STMNetwork ()))
-      _ -> return Nothing)
-  let (Just ch) = M.lookup "c" st
-  (s,m,r) <- atomically . readTChan $ ch
-  withInput net s m r (\e -> 
-    case e of
-      EventNew b -> when (b == encode' si) (atomically $ modifyTVar v (+1)) >> return (Nothing::Maybe (Action STMNetwork ()))
-      _ -> return Nothing)
-  assertEqual "correct encoded message" 2 =<< readTVarIO v 
-
-
-checkTChan :: (Show a, Eq a) => [a] -> TChan a -> Assertion
-checkTChan [] c = do
-  r <- atomically (tryReadTChan c) 
-  assertEqual "empty channel" Nothing r
-checkTChan (x:xs) c = do
-  r <- atomically (tryReadTChan c)
-  assertEqual "value in channel" (Just x) r
-  checkTChan xs c
+encode' :: Binary b => b -> S.ByteString
+encode' = S.concat . SL.toChunks . encode
+{-# INLINE encode' #-}

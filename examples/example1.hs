@@ -26,7 +26,7 @@ case01 = do
     net' <- if l=="a" then return net else cloneNetwork net
     let mch = extractCh net' l
     case mch of
-      Nothing -> return ()
+      Nothing -> error "no such network"
       Just ch -> forever $ do
                    (s, m, r) <- atomically $ readTChan ch
                    withInput net' s m r $ \e -> 

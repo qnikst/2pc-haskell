@@ -137,14 +137,14 @@ withInput a s b r f =
         ev <- hack <$> (try . f $! EventNew b1)
         case ev of
           Nothing -> return () -- just ignore
-          Just (Decline e) -> finishClient >> reply (ackNo t e)
+          Just (Decline e) -> reply (ackNo t e)
           Just (Accept  commit rollback) -> do
             atomically $ modifyTVar st (M.insert t (TClientInfo TVote commit rollback s))
             reply $! ackOk t
     go (PCommit t) = do
         mv <- atomically $ M.lookup t <$> readTVar (storageCohort . getStore $ a)
         case mv of
-          Nothing -> finishClient >> reply (PAck t (Left "transaction-expired"))
+          Nothing -> reply (PAck t (Left "transaction-expired"))
           Just info -> 
             case tclientState info of
               TVote -> do
@@ -161,7 +161,7 @@ withInput a s b r f =
                                            o -> M.insert t (info'{tclientState = o}))
                 reply x
                 if s' == TRollback 
-                      then finishClient >> atomically (modifyTVar st (M.delete t)) >> trollback info
+                      then atomically (modifyTVar st (M.delete t)) >> trollback info
                       else atomically $ modifyTVar st (M.insert t (info'{tclientState=s'}))
               TCommited  -> reply (ackOk t)
               TCommiting -> return () {- ? -}
@@ -178,10 +178,10 @@ withInput a s b r f =
                   case ret of
                     Left ex -> void . trySome . f $ EventRollbackE t ex
                     Right _ -> return ()
+                  reply (ackOk t)
               TCommiting -> return () {- ? -}
               _ -> return ()
             atomically $ modifyTVar st (M.delete t)
-            finishClient
     go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
         Nothing -> reply (PRollback t) -- send a r (encode' (PRollback t )) s
