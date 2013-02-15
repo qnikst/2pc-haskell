@@ -189,32 +189,38 @@ withInput a s b r f =
                            Left  e -> (False,e:rs)
                            Right _ -> (True,rs)
           in case tstate info of
-              TVote | S.null aw -> let (msg,st') = if null rs' then (PCommit t, TCommiting)
-                                                              else (PRollback t, TRollingback)
+              TVote | S.null aw -> let (msg,st',ps') = if null rs' 
+                                                            then (PCommit t, TCommiting, ps)
+                                                            else (PRollback t, TRollingback, s `S.delete` ps)
                                    in do atomically $ modifyTVar ct (M.insert t info{tstate=st',
-                                                                                     tresult=rs'
+                                                                                     tresult=rs',
+                                                                                     tparty=ps'
                                                                                     })
                                          mapM_ (send a (encode' msg)) ps
                     | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
                                                                               ,tresult=rs'})
               TCommiting | not ok -> let ps' = s `S.delete` ps
                                      in if S.null ps'
-                                            then do atomically $ putTMVar (result info) (Left rs')
-                                                    atomically $ modifyTVar ct (M.delete t)
+                                            then finishFail t info rs'
                                             else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
                                                                                       ,tawait=ps'
                                                                                       ,tresult=rs'
                                                                                       })
                                                     mapM_ (send a (encode' $ PRollback t)) ps'
-                         | S.null aw -> do atomically $ putTMVar (result info) (Right ())
-                                           atomically $ modifyTVar ct (M.delete t)
+                         | S.null aw -> finishOK t info
                          | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
-              TRollingback | S.null aw -> do atomically $ putTMVar (result info) (Left rs')
-                                             atomically $ modifyTVar ct (M.delete t)
+              TRollingback | S.null aw -> finishFail t info rs'
                            | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
                                                                                      ,tresult=rs'})
               TCommited -> error "illegal server state"
               TRollback -> error "illegal server state"
+    finishOK t info = atomically $ do
+                          putTMVar (result info) (Right ())
+                          modifyTVar ct (M.delete t)
+    finishFail t info m = atomically $ do
+                           putTMVar (result info) (Left m)
+                           modifyTVar ct (M.delete t)
+                              
 
 
             
@@ -237,6 +243,15 @@ waitResult a t = do
       Nothing -> return Nothing
       Just x  -> atomically $ Just <$> readTMVar (result x)
   where st = storageLeader. getStore $ a
+
+-- | get an STM function that will either read transaction result or retries.
+-- This function is usable if you want to add timeout to transaction: 
+-- @
+-- a <- transaction com Tran1 hosts
+-- t <- newTVar
+-- @
+-- stmResult :: (TPStorage a) => a -> TID -> IO (Maybe (STM Either [Bytestring] ()))
+-- stmResult a t = atomically $ F.mapM (\x -> readTMVar (result x) . M.lookup t <$> readTVar st
   
 
 toEvent :: (Binary b) => TEvent b -> TEvent ByteString
