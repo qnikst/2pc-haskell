@@ -13,19 +13,17 @@ import Control.Applicative
 import Control.Monad
 import Control.Concurrent
 import Control.Concurrent.STM
-import qualified Data.Map as M
-import Data.Binary
 import Data.ByteString (ByteString)
-import Data.List
 import qualified Data.ByteString as S
-import qualified Data.ByteString.Lazy as SL
 import Data.Maybe
 
 import Network.TwoPhase.STM
 import Network.TwoPhase
 
+main :: IO ()
 main = defaultMain tests
 
+tests :: [Test.Framework.Test]
 tests = [ testGroup "one host"
             [ testCase "True,True"   $ testTransaction [[True,True]] 
             , testCase "True,False"  $ testTransaction [[True,False]]
@@ -45,6 +43,7 @@ tests = [ testGroup "one host"
         ]
 
 
+testTransaction :: [[Bool]] -> IO ()
 testTransaction e = do
     xs <- mapM mkDesc e
     r <- experiment xs
@@ -80,9 +79,11 @@ data Description = D Bool Bool MB MB MB
 instance Show Description where
   show (D b1 b2 _ _ _) = "D{"++show b1++","++show b2++"} "
 
+mkDesc :: [Bool] -> IO Description
 mkDesc [a1, a2] = D a1 a2 <$> newTVarIO Nothing 
                           <*> newTVarIO Nothing
                           <*> newTVarIO Nothing
+mkDesc _ = error "!"
       
 
 runState :: STMNetwork -> S.ByteString -> Description -> IO ()
@@ -90,8 +91,8 @@ runState net n (D s1 s2 r1 r2 r3) =
     case extractCh net n of
       Nothing -> error "!!"
       Just ch  -> forever $ do
-        (s,m,r) <- atomically $ readTChan ch
-        withInput net s m r $ \x -> 
+        (s,m,_) <- atomically $ readTChan ch
+        withInput net s m $ \x -> 
             case x of
               EventNew _ | s1 -> accept
                          | otherwise  -> decline
@@ -112,24 +113,22 @@ experiment ds = do
             net' <- cloneNetwork net n
             runState net' n d
     t <- transaction net ("!"::S.ByteString) (map fst es)
-    forkIO $ do
-      case extractCh net "main" of
-        Nothing -> error "no ch"
-        Just ch  -> forever $ do
-          (s,m,r) <- atomically (readTChan ch)
-          withInput net s m r (const $ return Nothing)
+    _ <- forkIO $ do
+           case extractCh net "main" of
+             Nothing -> error "no ch"
+             Just ch  -> forever $ do
+                (s,m,_) <- atomically (readTChan ch)
+                withInput net s m (const $ return Nothing)
     x <- waitResult net t
     mapM_ (const yield) ls
     mapM_ killThread ls
     return x
   where ns = [S.singleton x | x <-[0..]]
 
-encode' :: Binary b => b -> S.ByteString
-encode' = S.concat . SL.toChunks . encode
-{-# INLINE encode' #-}
-
+isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False
 
+isRight :: Either a b -> Bool
 isRight (Right _) = True
 isRight _ = False

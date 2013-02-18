@@ -35,3 +35,4 @@ cloneNetwork (STMNetwork _ a _) f = STMNetwork f a <$> (Storage <$> newTVarIO M.
 
 extractCh :: STMNetwork -> ByteString -> Maybe (TChan Message)
 extractCh (STMNetwork _ a _) b = M.lookup b a
+

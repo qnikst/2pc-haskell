@@ -15,7 +15,7 @@ module Network.TwoPhase
 
 import Prelude hiding (sequence, mapM_)
 import Control.Applicative
-import Control.Monad (void, forM_, replicateM, when)
+import Control.Monad (void, forM_, replicateM)
 import Control.Concurrent.STM
 import Control.Exception
 import Data.Binary
@@ -46,7 +46,9 @@ data Protocol = PNewTransaction TID ByteString                                  
               | PAck TID (Either ByteString ())   -- ^ ack message
               deriving (Show)
 
+ackOk :: TID -> Protocol
 ackOk t = PAck t (Right ())
+ackNo :: Binary b => TID -> b -> Protocol
 ackNo t f = PAck t (Left (encode' f))
 
 
@@ -121,10 +123,9 @@ withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Show (Addr a))
           => a 
           -> Addr a
           -> ByteString 
-          -> Addr a
           -> TEvent ByteString
           -> IO ()
-withInput a s b r f = 
+withInput a s b f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
     in case ev of
          Done _ _  v -> go v
@@ -152,51 +153,52 @@ withInput a s b r f =
             case tclientState info of
               TVote -> goRollingBack t info
               TCommited  -> goRollingBack t info
+              TRollback -> reply (ackOk t)
               _ -> return () {- ? -}
-    go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
-      case xv of
-        Nothing -> reply (PRollback t)
-        Just info -> 
-          let aw = s `S.delete` tawait info
-              ps = tparty info
-              ps' = s `S.delete` ps
-              rs = tresult info
-              (ok,rs') = case x of 
-                           Left  e -> (False,e:rs)
-                           Right _ -> (True,rs)
-          in case tstate info of
-              TVote | S.null aw -> let (msg,st') = if null rs' 
-                                                        then (PCommit t, TCommiting)
-                                                        else (PRollback t, TRollingback)
-                                       ps'' | ok        = ps
-                                            | otherwise = ps'
-                                   in if st' == TCommiting 
-                                            then do atomically $ modifyTVar ct (M.insert t info{tstate=st',
-                                                                                     tresult=rs',
-                                                                                     tparty=ps''
-                                                                               })
-                                                    mapM_ (send a (encode' msg)) ps
-                                            else do mapM_ (send a (encode' msg)) ps''
-                                                    finishFail t info rs'
-                    | ok  -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
-                    | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
-                                                                              ,tresult=rs'
-                                                                              ,tparty=ps'
-                                                                              })
-              TCommiting | not ok -> if S.null ps'
-                                          then finishFail t info rs'
-                                          else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
-                                                                                      ,tawait=ps'
-                                                                                      ,tresult=rs'
-                                                                                      })
-                                                  mapM_ (send a (encode' $ PRollback t)) ps'
-                         | S.null aw -> finishOK t info
-                         | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
-              TRollingback | S.null aw -> finishFail t info rs'
-                           | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
-                                                                                     ,tresult=rs'})
-              TCommited -> error "illegal server state"
-              TRollback -> error "illegal server state"
+    go (PAck tid retData) = do
+        xv <- atomically $ M.lookup tid <$> readTVar ct
+        case xv of
+          Nothing   -> reply (PRollback tid)
+          Just info_ -> f' info_{tawait = aw, tresult = rs'}
+              where
+                f' = case tstate info_ of
+                            TVote -> goVote
+                            TCommiting -> inCommiting
+                            TRollingback -> inRollingBack
+                            _ -> error "illegal server state"
+                aw = s `S.delete` tawait info_
+                (ok,rs') = either (\e -> (False,e:tresult info_)) 
+                                  (const $ (True, tresult info_)) retData
+                inVote info | S.null (tparty info) {- nobody to responce -} = goFinalize info
+                            | S.null (tawait info) {- next state -} = goStep2 info 
+                            | otherwise = save info
+                inCommiting info | not ok = goRollingBack info{tparty = s `S.delete` tparty info}
+                                 | S.null (tawait info) = goFinalize info
+                                 | otherwise = save info 
+                inRollingBack info | S.null (tawait info) = goFinalize info
+                                   | otherwise = save info 
+                goVote info  | not ok = inVote info{tparty = s `S.delete` tparty info}
+                             | otherwise = inVote info
+                goStep2 info | null (tresult info) {- no errors -} = goCommiting info
+                             | otherwise = goRollingBack info
+                goCommiting info = runStep2 True info
+                goRollingBack info | S.null (tparty info) = goFinalize info
+                                   | otherwise = runStep2 False info
+
+                goFinalize info = let r = if null (tresult info)
+                                                then Right ()
+                                                else Left (tresult info)
+                                  in atomically $ do putTMVar (result info) r
+                                                     modifyTVar ct (M.delete tid)
+                save info = atomically $ modifyTVar ct (M.insert tid info)
+                runStep2 st i = 
+                  let (m,s) = if st then (PCommit, TCommiting) 
+                                    else (PRollback, TRollingback)
+                  in do atomically $ modifyTVar ct (M.insert tid i{tstate = s, tawait = tparty i})
+                        mapM_ (send a (encode' $ m tid)) (tparty i)
+
+
+    -- State blocks
     goInitialize tid dat_ = do
         ev <- hack <$> (try . f $! EventNew dat_)
         case ev of
@@ -213,6 +215,7 @@ withInput a s b r f =
           Left ex -> void . trySome . f $ EventRollbackE tid ex
           Right _ -> return ()
         atomically $ modifyTVar st (M.insert tid info{tclientState = TRollback})
+        reply $! ackOk tid
         goClean tid
     -- client clean block
     goCommiting tid info = do
@@ -225,13 +228,6 @@ withInput a s b r f =
           Right e -> do reply (ackOk tid)
                         atomically $ modifyTVar st (M.insert tid info{tclientState = TCommited})
     goClean tid = atomically $ modifyTVar st (M.delete tid)
-    finishOK t info = atomically $ do
-                          putTMVar (result info) (Right ())
-                          modifyTVar ct (M.delete t)
-    finishFail t info m = atomically $ do
-                           putTMVar (result info) (Left m)
-                           modifyTVar ct (M.delete t)
-
 
             
 transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO TID
