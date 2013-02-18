@@ -133,38 +133,16 @@ withInput a s b r f =
     st = storageCohort . getStore $ a
     ct = storageLeader . getStore $ a
     reply b' = send a (encode' b') s
-    go (PNewTransaction t b1) = do
-        ev <- hack <$> (try . f $! EventNew b1)
-        case ev of
-          Nothing -> return () -- just ignore
-          Just (Decline e) -> reply (ackNo t e)
-          Just (Accept  commit rollback) -> do
-            atomically $ modifyTVar st (M.insert t (TClientInfo TVote commit rollback s))
-            reply $! ackOk t
+    go (PNewTransaction t b1) = goInitialize t b1
     go (PCommit t) = do
-        mv <- atomically $ M.lookup t <$> readTVar (storageCohort . getStore $ a)
+        mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
           Nothing -> reply (PAck t (Left "transaction-expired"))
           Just info -> 
             case tclientState info of
-              TVote -> do
-                let info' = info {tclientState = TCommiting}
-                -- TODO: update persistent storage
-                atomically $ modifyTVar st (M.insert t info')
-                (x, s') <- either (\e -> (PAck t . Left . S8.pack $ show e, TRollback))
-                                  (const (ackOk t, TCommited))
-                                  <$> trySome (tcommit info)
-                -- TODO: update persistent storage
-                atomically $ modifyTVar st
-                                        (case s' of
-                                           TRollback -> M.delete t
-                                           o -> M.insert t (info'{tclientState = o}))
-                reply x
-                if s' == TRollback 
-                      then atomically (modifyTVar st (M.delete t)) >> trollback info
-                      else atomically $ modifyTVar st (M.insert t (info'{tclientState=s'}))
+              TVote -> goCommiting t info
               TCommited  -> reply (ackOk t)
-              TCommiting -> return () {- ? -}
+              TCommiting -> return () -- another thread will notify server it there are problems
               _ -> reply (PAck t (Left "illegal-state"))
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
@@ -172,24 +150,9 @@ withInput a s b r f =
           Nothing -> reply $ ackOk t
           Just info -> do
             case tclientState info of
-              TVote -> do
-                let info' = info {tclientState = TRollingback}
-                atomically $ modifyTVar st (M.insert t info')
-                ret <- trySome $ trollback info
-                case ret of
-                    Left ex -> void . trySome . f $ EventRollbackE t ex
-                    Right _ -> return ()
-              TCommited  -> do
-                  atomically $ modifyTVar st (M.insert t info{tclientState=TRollingback})
-                  ret <- trySome $ trollback info
-                  case ret of
-                    Left ex -> void . trySome . f $ EventRollbackE t ex
-                    Right _ -> return ()
-                  reply (ackOk t)
-              TCommiting -> return () {- ? -}
-
-              _ -> return ()
-            atomically $ modifyTVar st (M.delete t)
+              TVote -> goRollingBack t info
+              TCommited  -> goRollingBack t info
+              _ -> return () {- ? -}
     go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
         Nothing -> reply (PRollback t)
@@ -234,12 +197,41 @@ withInput a s b r f =
                                                                                      ,tresult=rs'})
               TCommited -> error "illegal server state"
               TRollback -> error "illegal server state"
+    goInitialize tid dat_ = do
+        ev <- hack <$> (try . f $! EventNew dat_)
+        case ev of
+          Nothing -> return () -- just ignore
+          Just (Decline e) -> reply (ackNo tid e)
+          Just (Accept commit rollback) -> do
+            atomically $ modifyTVar st (M.insert tid (TClientInfo TVote commit rollback s))
+            reply $! ackOk tid
+    -- client rolling back block
+    goRollingBack tid info = do 
+        atomically $ modifyTVar st (M.insert tid info{tclientState = TRollingback}) -- TODO adjust (?)
+        ret <- trySome $ trollback info
+        case ret of
+          Left ex -> void . trySome . f $ EventRollbackE tid ex
+          Right _ -> return ()
+        atomically $ modifyTVar st (M.insert tid info{tclientState = TRollback})
+        goClean tid
+    -- client clean block
+    goCommiting tid info = do
+        -- TODO: update persistent storage
+        atomically $ modifyTVar st (M.insert tid info{tclientState = TCommiting})
+        ret <- trySome (tcommit info)
+        case ret of
+          Left e -> do reply (PAck tid . Left . S8.pack $ show e)
+                       goRollingBack tid info
+          Right e -> do reply (ackOk tid)
+                        atomically $ modifyTVar st (M.insert tid info{tclientState = TCommited})
+    goClean tid = atomically $ modifyTVar st (M.delete tid)
     finishOK t info = atomically $ do
                           putTMVar (result info) (Right ())
                           modifyTVar ct (M.delete t)
     finishFail t info m = atomically $ do
                            putTMVar (result info) (Left m)
                            modifyTVar ct (M.delete t)
+
 
             
 transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO TID
