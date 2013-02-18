@@ -172,6 +172,13 @@ withInput a s b r f =
           Nothing -> reply $ ackOk t
           Just info -> do
             case tclientState info of
+              TVote -> do
+                let info' = info {tclientState = TRollingback}
+                atomically $ modifyTVar st (M.insert t info')
+                ret <- trySome $ trollback info
+                case ret of
+                    Left ex -> void . trySome . f $ EventRollbackE t ex
+                    Right _ -> return ()
               TCommited  -> do
                   atomically $ modifyTVar st (M.insert t info{tclientState=TRollingback})
                   ret <- trySome $ trollback info
@@ -180,37 +187,46 @@ withInput a s b r f =
                     Right _ -> return ()
                   reply (ackOk t)
               TCommiting -> return () {- ? -}
+
               _ -> return ()
             atomically $ modifyTVar st (M.delete t)
     go (PAck t x) = atomically (M.lookup t <$> readTVar ct) >>= \xv ->
       case xv of
-        Nothing -> reply (PRollback t) -- send a r (encode' (PRollback t )) s
+        Nothing -> reply (PRollback t)
         Just info -> 
           let aw = s `S.delete` tawait info
               ps = tparty info
+              ps' = s `S.delete` ps
               rs = tresult info
               (ok,rs') = case x of 
                            Left  e -> (False,e:rs)
                            Right _ -> (True,rs)
           in case tstate info of
-              TVote | S.null aw -> let (msg,st',ps') = if null rs' 
-                                                            then (PCommit t, TCommiting, ps)
-                                                            else (PRollback t, TRollingback, s `S.delete` ps)
-                                   in do atomically $ modifyTVar ct (M.insert t info{tstate=st',
+              TVote | S.null aw -> let (msg,st') = if null rs' 
+                                                        then (PCommit t, TCommiting)
+                                                        else (PRollback t, TRollingback)
+                                       ps'' | ok        = ps
+                                            | otherwise = ps'
+                                   in if st' == TCommiting 
+                                            then do atomically $ modifyTVar ct (M.insert t info{tstate=st',
                                                                                      tresult=rs',
-                                                                                     tparty=ps'
-                                                                                    })
-                                         mapM_ (send a (encode' msg)) ps
+                                                                                     tparty=ps''
+                                                                               })
+                                                    mapM_ (send a (encode' msg)) ps
+                                            else do mapM_ (send a (encode' msg)) ps''
+                                                    finishFail t info rs'
+                    | ok  -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
                     | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw
-                                                                              ,tresult=rs'})
-              TCommiting | not ok -> let ps' = s `S.delete` ps
-                                     in if S.null ps'
-                                            then finishFail t info rs'
-                                            else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
+                                                                              ,tresult=rs'
+                                                                              ,tparty=ps'
+                                                                              })
+              TCommiting | not ok -> if S.null ps'
+                                          then finishFail t info rs'
+                                          else do atomically $ modifyTVar ct (M.insert t info{tstate=TRollingback
                                                                                       ,tawait=ps'
                                                                                       ,tresult=rs'
                                                                                       })
-                                                    mapM_ (send a (encode' $ PRollback t)) ps'
+                                                  mapM_ (send a (encode' $ PRollback t)) ps'
                          | S.null aw -> finishOK t info
                          | otherwise -> atomically $ modifyTVar ct (M.insert t info{tawait=aw})
               TRollingback | S.null aw -> finishFail t info rs'
