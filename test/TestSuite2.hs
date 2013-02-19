@@ -40,6 +40,20 @@ tests = [ testGroup "one host"
                 , [[True,False],[True,False]]
                 , [[False,True],[False,True]]
                 ] 
+        , testGroup "3 hosts" $
+              map (\x -> testCase (show x) $ testTransaction x)
+                [ [[True,True],[True,True],[True,True]]
+                , [[True,False],[True,True],[True,True]]
+                , [[False,True],[True,True],[True,True]]
+                , [[True,True],[False,True],[True,True]]
+                , [[False,False],[True,True],[True,True]]
+                , [[True,False],[True,False],[True,False]]
+                , [[False,True],[False,True],[True,True]]
+                ] 
+        , testGroup "timeout" $
+                [ testCase "timeout (before)" $ testTimeout True
+                , testCase "timeout (fail)" $ testTimeout False
+                ]
         ]
 
 
@@ -104,7 +118,6 @@ runState net n (D s1 s2 r1 r2 r3) =
            | otherwise = atomically (writeTVar r2 (Just False)) >> error "!!!"
     rollback = atomically (writeTVar r3 (Just True))
     
-
 experiment :: [Description] -> IO (Maybe (Either [ByteString] ()))
 experiment ds = do
     let es = zip ns ds
@@ -124,6 +137,35 @@ experiment ds = do
     mapM_ killThread ls
     return x
   where ns = [S.singleton x | x <-[0..]]
+
+
+testTimeout ret = do
+  com <- mkNetwork "main" ["a","b"]
+  a <- transaction com ("1"::ByteString) ["b"]
+  when ret $ void . forkIO $ do com' <- cloneNetwork com "b" 
+                                case extractCh com' "b" of
+                                        Nothing -> return ()
+                                        Just ch -> forever $ do
+                                          (s,m,_) <- atomically $ readTChan ch
+                                          withInput com' s m (const . return . Just $ Accept (return ()) (return ()))
+  t <- registerDelay 500000
+  mf <- stmResult com a
+  _ <- forkIO $ do
+         case extractCh com "main" of
+             Nothing -> return ()
+             Just ch  -> forever $ do
+                (s,m,_) <- atomically (readTChan ch)
+                withInput com s m (const $ return Nothing)
+  r <- case mf of
+            Nothing -> return $ Left ["no reply"] 
+            Just f  -> atomically $ f `orElse`
+                          (readTVar t 
+                           >>= flip unless retry 
+                           >>  return (Left ["timeout"]))
+  if ret 
+      then assertEqual "transaction finished" (Right ()) r
+      else assertEqual "transaction timeout"  (Left ["timeout"]) r
+    
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True

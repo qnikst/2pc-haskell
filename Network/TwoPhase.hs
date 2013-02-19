@@ -10,6 +10,7 @@ module Network.TwoPhase
   , mkStorage 
   , transaction
   , waitResult
+  , stmResult
   , toEvent
   ) where
 
@@ -25,6 +26,7 @@ import qualified Data.ByteString as S (concat, pack)
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as SL
 import Data.Foldable (mapM_)
+import Data.Traversable as T
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Set (Set)
@@ -252,12 +254,23 @@ waitResult a t = do
 
 -- | get an STM function that will either read transaction result or retries.
 -- This function is usable if you want to add timeout to transaction: 
+--
 -- @
 -- a <- transaction com Tran1 hosts
--- t <- newTVar
+-- t <- registerDelay 1000000
+-- mf <- stmResult com a
+-- print =<< case mf of
+--             Nothing -> return ()
+--             Just f  -> atomically $ f `orElse`
+--                            (readTVar t >>= flip unless retry >>= return ["timeout"])
 -- @
--- stmResult :: (TPStorage a) => a -> TID -> IO (Maybe (STM Either [Bytestring] ()))
--- stmResult a t = atomically $ F.mapM (\x -> readTMVar (result x) . M.lookup t <$> readTVar st
+stmResult :: (TPStorage a) => a -> TID -> IO (Maybe (STM (Either [ByteString] ())))
+stmResult a t = do
+    x <- atomically $ M.lookup t <$> readTVar ct
+    return $ case x of
+               Nothing -> Nothing
+               Just t  -> Just . readTMVar $ result t
+  where ct = storageLeader . getStore $ a
   
 
 toEvent :: (Binary b) => TEvent b -> TEvent ByteString
