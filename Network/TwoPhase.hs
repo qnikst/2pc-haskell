@@ -1,24 +1,30 @@
-{-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings #-}
+{-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings, DeriveDataTypeable #-}
 module Network.TwoPhase 
   ( TPNetwork(..)
   , TPStorage(..)
   , withInput
   , Action(..)
   , Storage(..)
-  , Event(..)
   -- ** functions
   , mkStorage 
   , transaction
   , waitResult
   , stmResult
-  , toEvent
+  , module Control.Concurrent.STM.Split.TVar
+  -- ** asynchronous api
+  --, accept
+  --, decline
+  --, rollback
   ) where
 
 import Prelude hiding (sequence, mapM_)
 import Control.Applicative
-import Control.Monad (void, forM_, replicateM)
 import Control.Concurrent.STM
+import Control.Concurrent.STM.Split.TVar
+import Control.Concurrent.STM.Split.Class
 import Control.Exception
+import Control.Monad (void, forM_, replicateM)
+import Control.Monad.Error (Error())
 import Data.Binary
 import Data.Binary.Get
 import Data.ByteString (ByteString)
@@ -27,6 +33,7 @@ import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as SL
 import Data.Foldable (mapM_)
 import Data.Traversable as T
+import Data.Typeable
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Set (Set)
@@ -41,7 +48,15 @@ class TPNetwork a where
   type Addr a
   send :: a -> ByteString -> Addr a -> IO ()
 
--- | Simple protocol
+
+data TwoPhaseException = ERollback TID
+                       | ERollbackE TID SomeException
+                       | EIllegalState TState
+                       deriving (Typeable, Show)
+
+instance Error TwoPhaseException
+instance Exception TwoPhaseException
+
 data Protocol = PNewTransaction TID ByteString                                      -- ^ new transaction message
               | PCommit  TID                                                        -- ^ commit message
               | PRollback TID -- ^ rollback message
@@ -69,6 +84,13 @@ instance Binary Protocol where
 
 -- | Transaction ID
 type TID = ByteString
+type TRollback = IO ()
+type TCommit   = IO ()
+type TEvent  a = a -> IO (Maybe Action)
+type TErrors   = [ByteString]
+type TResult x = SpTVar x (Maybe (Either TErrors ()))
+
+data THandler = THandler !TID !(TResult Out)
 
 class (TPNetwork a) => TPStorage a where
   getStore :: a -> Storage a
@@ -83,10 +105,9 @@ mkStorage :: IO (Storage a)
 mkStorage = Storage <$> newTVarIO M.empty 
                     <*> newTVarIO M.empty
 
-type TRollback = IO ()
-type TCommit   = IO ()
-type TEvent  a = Event a -> IO (Maybe Action)
 
+-- | Simple protocol
+-- | Simple protocol
 -- | Transaction state
 data TState = TVote
             | TRollingback
@@ -96,12 +117,12 @@ data TState = TVote
             deriving (Eq, Show)
 
 data TServerInfo a = TServerInfo
-      { tstate       :: TState
+      { tstate       :: !TState
       , tparty       :: Set (Addr a)
       , tawait       :: Set (Addr a)
-      , tdata        :: ByteString
-      , tresult      :: [ByteString]
-      , result       :: TMVar (Either [ByteString] ())
+      , tdata        :: !ByteString
+      , tresult      :: ![ByteString]
+      , result       :: TResult In
       }
 
 data TClientInfo a = TClientInfo 
@@ -110,11 +131,6 @@ data TClientInfo a = TClientInfo
       , trollback    :: TRollback                             -- ^ rollback action
       , tcsender     :: Addr a
       }
-
--- | UI Events
-data Event b = EventNew b                            -- ^ new transaction received
-             | EventRollback TID                     -- ^ transaction without corresponding information rolled back
-             | EventRollbackE TID SomeException      -- ^ rollback failed
 
 -- | User actions
 data Action = Decline ByteString
@@ -150,7 +166,9 @@ withInput a s b f =
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
-          Nothing -> reply $ ackOk t
+          Nothing -> do
+              reply $ ackOk t
+              throw (ERollback t)
           Just info -> do
             case tclientState info of
               TVote -> goRollingBack t info
@@ -190,7 +208,7 @@ withInput a s b f =
                 goFinalize info = let r = if null (tresult info)
                                                 then Right ()
                                                 else Left (tresult info)
-                                  in atomically $ do putTMVar (result info) r
+                                  in atomically $ do writeSpTVar (result info) (Just r)
                                                      modifyTVar ct (M.delete tid)
                 save info = atomically $ modifyTVar ct (M.insert tid info)
                 runStep2 st i = 
@@ -202,7 +220,7 @@ withInput a s b f =
 
     -- State blocks
     goInitialize tid dat_ = do
-        ev <- hack <$> (try . f $! EventNew dat_)
+        ev <- hack <$> (try $! f dat_)
         case ev of
           Nothing -> return () -- just ignore
           Just (Decline e) -> reply (ackNo tid e)
@@ -213,15 +231,14 @@ withInput a s b f =
     goRollingBack tid info = do 
         atomically $ modifyTVar st (M.insert tid info{tclientState = TRollingback}) -- TODO adjust (?)
         ret <- trySome $ trollback info
-        case ret of
-          Left ex -> void . trySome . f $ EventRollbackE tid ex
-          Right _ -> return ()
         atomically $ modifyTVar st (M.insert tid info{tclientState = TRollback})
         reply $! ackOk tid
         goClean tid
+        case ret of
+          Left ex -> throw ex
+          Right _ -> return ()
     -- client clean block
     goCommiting tid info = do
-        -- TODO: update persistent storage
         atomically $ modifyTVar st (M.insert tid info{tclientState = TCommiting})
         ret <- trySome (tcommit info)
         case ret of
@@ -232,25 +249,20 @@ withInput a s b f =
     goClean tid = atomically $ modifyTVar st (M.delete tid)
 
             
-transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO TID
+transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO THandler
 transaction a d rs = do
     tid <- generateTID
-    box <- newEmptyTMVarIO
-    let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] box
+    (inBox, outBox) <- splitTVar <$> newTVarIO Nothing
+    let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] inBox
     atomically $ modifyTVar st (M.insert tid info)
     forM_ rs $ \r -> send a (encode' (PNewTransaction tid db)) r
-    return tid
+    return (THandler tid outBox)
   where db = encode' d
         st = storageLeader . getStore $ a
 
 
-waitResult :: (TPStorage a) => a -> TID -> IO (Maybe (Either [ByteString] ()))
-waitResult a t = do 
-    mx <- atomically $ M.lookup t <$> readTVar st
-    case mx of
-      Nothing -> return Nothing
-      Just x  -> atomically $ Just <$> readTMVar (result x)
-  where st = storageLeader. getStore $ a
+waitResult :: THandler -> IO (Either [ByteString] ())
+waitResult (THandler _ r) = atomically $ maybe retry return =<< readSpTVar r
 
 -- | get an STM function that will either read transaction result or retries.
 -- This function is usable if you want to add timeout to transaction: 
@@ -258,29 +270,12 @@ waitResult a t = do
 -- @
 -- a <- transaction com Tran1 hosts
 -- t <- registerDelay 1000000
--- mf <- stmResult com a
--- print =<< case mf of
---             Nothing -> return ()
---             Just f  -> atomically $ f `orElse`
+-- print =<< atomically $ (stmResult t) `orElse`
 --                            (readTVar t >>= flip unless retry >>= return ["timeout"])
 -- @
-stmResult :: (TPStorage a) => a -> TID -> IO (Maybe (STM (Either [ByteString] ())))
-stmResult a t = do
-    x <- atomically $ M.lookup t <$> readTVar ct
-    return $ case x of
-               Nothing -> Nothing
-               Just t  -> Just . readTMVar $ result t
-  where ct = storageLeader . getStore $ a
+stmResult :: THandler -> STM (Either [ByteString] ())
+stmResult (THandler _ x) = maybe retry return =<< readSpTVar x
   
-
-toEvent :: (Binary b) => TEvent b -> TEvent ByteString
-toEvent f = \x -> f (fromBS x) 
-  where
-    fromBS :: (Binary b) => Event ByteString -> Event b
-    fromBS (EventNew b) = EventNew (decode' b)
-    fromBS (EventRollback t) = EventRollback t
-    fromBS (EventRollbackE t e) = EventRollbackE t e
-
 
 hack :: Either SomeException (Maybe Action) -> Maybe Action
 hack (Left e) = Just (Decline . S8.pack $! show e)
@@ -291,6 +286,7 @@ encode' :: forall b . Binary b => b -> ByteString
 encode' = S.concat . SL.toChunks . encode
 {-# INLINE encode' #-}
 
+
 trySome :: IO a -> IO (Either SomeException a)
 trySome = try
 
@@ -298,16 +294,3 @@ generateTID :: IO ByteString
 generateTID = MWC.withSystemRandom . MWC.asGenIO $ \gen ->
                     S.pack <$> replicateM 20 (MWC.uniform gen)
 
-decode' :: (Binary b) => ByteString -> b
-decode' b = 
-  case (pushEndOfInput $ pushChunk (runGetIncremental get) b) of
-    Done _ _ v -> v
-    _ -> error "no parse"
-
-{-
-decodeMay' :: (Binary b) => ByteString -> Maybe b
-decodeMay' b = 
-  case (pushEndOfInput $ pushChunk (runGetIncremental get) b) of
-    Done _ _ v -> return v
-    _ -> fail "no parse"
--}

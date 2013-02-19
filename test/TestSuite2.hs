@@ -24,12 +24,13 @@ main :: IO ()
 main = defaultMain tests
 
 tests :: [Test.Framework.Test]
-tests = [ testGroup "one host"
-            [ testCase "True,True"   $ testTransaction [[True,True]] 
-            , testCase "True,False"  $ testTransaction [[True,False]]
-            , testCase "False,True"  $ testTransaction [[False,True]]
-            , testCase "False,False" $ testTransaction [[False,False]]
-            ]
+tests = [ testGroup "one host" $
+              map (\x -> testCase (show x) $ testTransaction x)
+                [ [[True,True]]
+                , [[True,False]]
+                , [[False,True]]
+                , [[False,False]]
+                ] 
         , testGroup "2 hosts" $
               map (\x -> testCase (show x) $ testTransaction x)
                 [ [[True,True],[True,True]]
@@ -62,9 +63,8 @@ testTransaction e = do
     xs <- mapM mkDesc e
     r <- experiment xs
     let tAll = all (all id) e
-        r' = fromJust r
-        res  = if tAll then isRight r'
-                       else isLeft r'
+        res  = if tAll then isRight r
+                       else isLeft r
     assertBool "got matching result" res
     mapM_ (checkD (chS1 e) (chS2 e)) xs
   where 
@@ -106,11 +106,7 @@ runState net n (D s1 s2 r1 r2 r3) =
       Nothing -> error "!!"
       Just ch  -> forever $ do
         (s,m,_) <- atomically $ readTChan ch
-        withInput net s m $ \x -> 
-            case x of
-              EventNew _ | s1 -> accept
-                         | otherwise  -> decline
-              _   -> error "!"
+        withInput net s m $ \x -> if s1 then accept else decline
   where
     accept = atomically (writeTVar r1 (Just True)) >> return (Just (Accept commit rollback))
     decline = atomically (writeTVar r1 (Just False)) >> return (Just (Decline "!!"))
@@ -118,7 +114,7 @@ runState net n (D s1 s2 r1 r2 r3) =
            | otherwise = atomically (writeTVar r2 (Just False)) >> error "!!!"
     rollback = atomically (writeTVar r3 (Just True))
     
-experiment :: [Description] -> IO (Maybe (Either [ByteString] ()))
+experiment :: [Description] -> IO (Either [ByteString] ())
 experiment ds = do
     let es = zip ns ds
     net <- mkNetwork "main" (map fst es)
@@ -132,7 +128,7 @@ experiment ds = do
              Just ch  -> forever $ do
                 (s,m,_) <- atomically (readTChan ch)
                 withInput net s m (const $ return Nothing)
-    x <- waitResult net t
+    x <- waitResult t
     mapM_ (const yield) ls
     mapM_ killThread ls
     return x
@@ -149,19 +145,16 @@ testTimeout ret = do
                                           (s,m,_) <- atomically $ readTChan ch
                                           withInput com' s m (const . return . Just $ Accept (return ()) (return ()))
   t <- registerDelay 500000
-  mf <- stmResult com a
   _ <- forkIO $ do
          case extractCh com "main" of
              Nothing -> return ()
              Just ch  -> forever $ do
                 (s,m,_) <- atomically (readTChan ch)
                 withInput com s m (const $ return Nothing)
-  r <- case mf of
-            Nothing -> return $ Left ["no reply"] 
-            Just f  -> atomically $ f `orElse`
-                          (readTVar t 
-                           >>= flip unless retry 
-                           >>  return (Left ["timeout"]))
+  r <- atomically $ (stmResult a) `orElse`
+                       (readTVar t 
+                        >>= flip unless retry 
+                        >>  return (Left ["timeout"]))
   if ret 
       then assertEqual "transaction finished" (Right ()) r
       else assertEqual "transaction timeout"  (Left ["timeout"]) r

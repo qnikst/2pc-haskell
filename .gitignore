@@ -1,2 +1,7 @@
 /dist/
 /cabal-dev/
+/.hpc/
+/hpc-markup/
+*.tix
+*.hi
+*.o
