@@ -19,7 +19,7 @@ library
                        Control.Concurrent.STM.Split.TVar
   -- other-modules:       
   build-depends:       base ==4.6.*, stm ==2.4.*, binary ==0.6.*, bytestring ==0.10.*, containers ==0.5.*,mtl,
-                       vector, mwc-random
+                       vector, mwc-random, either
   ghc-options:         -Wall
 
 test-suite  2pc-tests

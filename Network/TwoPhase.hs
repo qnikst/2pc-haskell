@@ -6,10 +6,15 @@ module Network.TwoPhase
   , Action(..)
   , Storage(..)
   , mkStorage 
-  -- ** API
+  -- * API
+  -- ** server
+  -- $server
   , transaction
   , waitResult
   , stmResult
+  , cancel
+  , timeout
+  , runServer
   -- ** asynchronous api
   --, accept
   --, decline
@@ -24,15 +29,17 @@ import Control.Concurrent.STM
 import Control.Concurrent.STM.Split.TVar
 import Control.Concurrent.STM.Split.Class
 import Control.Exception
-import Control.Monad (forM_, replicateM)
+import Control.Monad (replicateM, (<=<), unless, forever)
 import Control.Monad.Error (Error())
+import Control.Monad.Trans
+import Control.Monad.Trans.Either
 import Data.Binary
 import Data.Binary.Get
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S (concat, pack)
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as SL
-import Data.Foldable (mapM_)
+import Data.Foldable (mapM_, forM_) 
 import Data.Typeable
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -51,7 +58,7 @@ class TPNetwork a where
 
 data TwoPhaseException = ERollback TID
                        | ERollbackE TID SomeException
-                       | EIllegalState TState
+                       | ETransactionNotFound TID
                        deriving (Typeable, Show)
 
 instance Error TwoPhaseException
@@ -84,12 +91,12 @@ instance Binary Protocol where
 
 -- | Transaction ID
 type TID = ByteString
+type TransactionResult = Either TErrors ()
 type TRollback = IO ()
 type TCommit   = IO ()
 type TEvent  a = a -> IO (Maybe Action)
 type TErrors   = [ByteString]
-type TResult x = SpTVar x (Maybe (Either TErrors ()))
-
+type TResult x = SpTVar x (Maybe TransactionResult)
 data THandler = THandler !TID !(TResult Out)
 
 class (TPNetwork a) => TPStorage a where
@@ -137,7 +144,7 @@ data Action = Decline ByteString
             | Accept  TCommit TRollback
 
 
-withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Show (Addr a))
+withInput :: (TPNetwork a, TPStorage a, Ord (Addr a))
           => a 
           -> Addr a
           -> ByteString 
@@ -204,7 +211,6 @@ withInput a s b f =
                 goCommitingS info = runStep2 True info
                 goRollingBackS info | S.null (tparty info) = goFinalize info
                                     | otherwise = runStep2 False info
-
                 goFinalize info = let r = if null (tresult info)
                                                 then Right ()
                                                 else Left (tresult info)
@@ -276,6 +282,50 @@ waitResult (THandler _ r) = atomically $ maybe retry return =<< readSpTVar r
 stmResult :: THandler -> STM (Either [ByteString] ())
 stmResult (THandler _ x) = maybe retry return =<< readSpTVar x
   
+-- | cancels non finished transaction. 
+-- This functon sets status to Rolling back and sends rollback events. You need to 
+-- wait result to guarantee that transaction is finished
+cancel :: (TPStorage a, TPNetwork a) => a -> THandler -> IO (Either TwoPhaseException ())
+cancel a (THandler t _) = runEitherT $ do -- TODO use goRollbackingS function
+    x <- hoistEither <=< liftIO . atomically $ do
+        mx <- M.lookup t <$> readTVar ct
+        case mx of
+          Nothing -> return $ Left (ETransactionNotFound t)
+          Just x  -> do modifyTVar ct (M.adjust (\i -> i{tstate = TRollingback, tawait= tparty i}) t) 
+                        return $ Right x
+    lift $ do 
+      forM_ (tparty x) $ \r -> send a (encode' (PRollback t)) r
+  where ct = storageLeader . getStore $ a
+
+-- | create transaction with timeout, this is operation will be locked untill it completes
+-- note require -threaded, see 'Control.Concurrent.STM.TVar' registerDelay
+timeout :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) 
+        => Int 
+        -> a 
+        -> d 
+        -> [Addr a] 
+        -> IO (Maybe TransactionResult)
+timeout t a b c = do
+  h <- transaction a b c
+  d <- registerDelay t
+  mr <- atomically $ (Just <$> stmResult h)
+           `orElse` (readTVar d >>= flip unless retry >> return Nothing)
+  case mr of
+    Nothing -> cancel a h >> return Nothing
+    _ -> return mr
+
+-- | Helper to run leader
+-- you can use this function is you can guarantee that this controller will always be a leader.
+runServer :: (TPStorage a, TPNetwork a, Ord (Addr a))
+          => a
+          -> (IO (Addr a, ByteString)) 
+          -> IO ()
+runServer c feeder = forever $ feeder >>= \(a,b) -> withInput c a b (const . return . Just $ Decline "server")
+
+-- $server
+-- Transaction leader can control transaction flow only by high level API:
+-- that gives an ability to create and cancel transactions. 
+
 
 hack :: Either SomeException (Maybe Action) -> Maybe Action
 hack (Left e) = Just (Decline . S8.pack $! show e)
@@ -302,3 +352,5 @@ decodeMay' b =
       Done _ _  v -> return v
       _ -> fail "no parse"
 
+
+-- |
