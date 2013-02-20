@@ -9,6 +9,8 @@ module Network.TwoPhase
   -- * API
   -- ** server
   -- $server
+  , THandler
+  , TransactionResult
   , transaction
   , waitResult
   , stmResult
@@ -97,6 +99,8 @@ type TCommit   = IO ()
 type TEvent  a = a -> IO (Maybe Action)
 type TErrors   = [ByteString]
 type TResult x = SpTVar x (Maybe TransactionResult)
+
+-- | Transaction handler is used to control transaction flow on server
 data THandler = THandler !TID !(TResult Out)
 
 class (TPNetwork a) => TPStorage a where
@@ -255,7 +259,12 @@ withInput a s b f =
     goClean tid = atomically $ modifyTVar st (M.delete tid)
 
             
-transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) => a -> d -> [Addr a] -> IO THandler
+-- | Start asynchonous transaction
+transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) 
+            => a -- ^ transaction controller 
+            -> d -- ^ event 
+            -> [Addr a]  -- ^ list of partipitiants
+            -> IO THandler
 transaction a d rs = do
     tid <- generateTID
     (inBox, outBox) <- splitTVar <$> newTVarIO Nothing
@@ -266,8 +275,8 @@ transaction a d rs = do
   where db = encode' d
         st = storageLeader . getStore $ a
 
-
-waitResult :: THandler -> IO (Either [ByteString] ())
+-- | Lock until transaction is finished
+waitResult :: THandler -> IO TransactionResult
 waitResult (THandler _ r) = atomically $ maybe retry return =<< readSpTVar r
 
 -- | get an STM function that will either read transaction result or retries.
@@ -279,7 +288,7 @@ waitResult (THandler _ r) = atomically $ maybe retry return =<< readSpTVar r
 -- print =<< atomically $ (stmResult t) `orElse`
 --                            (readTVar t >>= flip unless retry >>= return ["timeout"])
 -- @
-stmResult :: THandler -> STM (Either [ByteString] ())
+stmResult :: THandler -> STM TransactionResult
 stmResult (THandler _ x) = maybe retry return =<< readSpTVar x
   
 -- | cancels non finished transaction. 
