@@ -12,7 +12,8 @@ fi
 #${CABAL_DEV} build || exit 1
 #${CABAL_DEV} test  || exit 1
 
-ghc -fhpc test/TestSuite2.hs
+ghc -fhpc -threaded test/TestSuite2.hs
+rm TestSuite2.tix
 ./test/TestSuite2
 
 #dist/build/2pc-tests/2pc-tests

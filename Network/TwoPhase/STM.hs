@@ -26,12 +26,10 @@ instance TPStorage STMNetwork where
 
 mkNetwork :: ByteString -> [ByteString] -> IO STMNetwork
 mkNetwork n bs = STMNetwork n <$> (M.fromList <$> mapM (\x -> (,) x <$> newTChanIO) (n:bs))
-                              <*> (Storage <$> newTVarIO M.empty
-                                           <*> newTVarIO M.empty)
+                              <*> mkStorage
 
 cloneNetwork :: STMNetwork -> ByteString -> IO STMNetwork
-cloneNetwork (STMNetwork _ a _) f = STMNetwork f a <$> (Storage <$> newTVarIO M.empty
-                                                              <*> newTVarIO M.empty)
+cloneNetwork (STMNetwork _ a _) f = STMNetwork f a <$> mkStorage
 
 extractCh :: STMNetwork -> ByteString -> Maybe (TChan Message)
 extractCh (STMNetwork _ a _) b = M.lookup b a

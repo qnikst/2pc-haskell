@@ -14,7 +14,9 @@ build-type:          Simple
 cabal-version:       >=1.8
 
 library
-  exposed-modules:     Network.TwoPhase, Network.TwoPhase.STM
+  exposed-modules:     Network.TwoPhase, Network.TwoPhase.STM,
+                       Control.Concurrent.STM.Split.Class,
+                       Control.Concurrent.STM.Split.TVar
   -- other-modules:       
   build-depends:       base ==4.6.*, stm ==2.4.*, binary ==0.6.*, bytestring ==0.10.*, containers ==0.5.*,mtl,
                        vector, mwc-random

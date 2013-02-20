@@ -5,16 +5,17 @@ module Network.TwoPhase
   , withInput
   , Action(..)
   , Storage(..)
-  -- ** functions
   , mkStorage 
+  -- ** API
   , transaction
   , waitResult
   , stmResult
-  , module Control.Concurrent.STM.Split.TVar
   -- ** asynchronous api
   --, accept
   --, decline
   --, rollback
+  , decoding
+  , module Control.Concurrent.STM.Split.TVar
   ) where
 
 import Prelude hiding (sequence, mapM_)
@@ -23,7 +24,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.STM.Split.TVar
 import Control.Concurrent.STM.Split.Class
 import Control.Exception
-import Control.Monad (void, forM_, replicateM)
+import Control.Monad (forM_, replicateM)
 import Control.Monad.Error (Error())
 import Data.Binary
 import Data.Binary.Get
@@ -32,7 +33,6 @@ import qualified Data.ByteString as S (concat, pack)
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as SL
 import Data.Foldable (mapM_)
-import Data.Traversable as T
 import Data.Typeable
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -192,18 +192,18 @@ withInput a s b f =
                 inVote info | S.null (tparty info) {- nobody to responce -} = goFinalize info
                             | S.null (tawait info) {- next state -} = goStep2 info 
                             | otherwise = save info
-                inCommiting info | not ok = goRollingBack info{tparty = s `S.delete` tparty info}
+                inCommiting info | not ok = goRollingBackS info{tparty = s `S.delete` tparty info}
                                  | S.null (tawait info) = goFinalize info
                                  | otherwise = save info 
                 inRollingBack info | S.null (tawait info) = goFinalize info
                                    | otherwise = save info 
                 goVote info  | not ok = inVote info{tparty = s `S.delete` tparty info}
                              | otherwise = inVote info
-                goStep2 info | null (tresult info) {- no errors -} = goCommiting info
-                             | otherwise = goRollingBack info
-                goCommiting info = runStep2 True info
-                goRollingBack info | S.null (tparty info) = goFinalize info
-                                   | otherwise = runStep2 False info
+                goStep2 info | null (tresult info) {- no errors -} = goCommitingS info
+                             | otherwise = goRollingBackS info
+                goCommitingS info = runStep2 True info
+                goRollingBackS info | S.null (tparty info) = goFinalize info
+                                    | otherwise = runStep2 False info
 
                 goFinalize info = let r = if null (tresult info)
                                                 then Right ()
@@ -211,9 +211,9 @@ withInput a s b f =
                                   in atomically $ do writeSpTVar (result info) (Just r)
                                                      modifyTVar ct (M.delete tid)
                 save info = atomically $ modifyTVar ct (M.insert tid info)
-                runStep2 st i = 
-                  let (m,s) = if st then (PCommit, TCommiting) 
-                                    else (PRollback, TRollingback)
+                runStep2 state i = 
+                  let (m,s) = if state then (PCommit, TCommiting) 
+                                       else (PRollback, TRollingback)
                   in do atomically $ modifyTVar ct (M.insert tid i{tstate = s, tawait = tparty i})
                         mapM_ (send a (encode' $ m tid)) (tparty i)
 
@@ -244,7 +244,7 @@ withInput a s b f =
         case ret of
           Left e -> do reply (PAck tid . Left . S8.pack $ show e)
                        goRollingBack tid info
-          Right e -> do reply (ackOk tid)
+          Right _ -> do reply (ackOk tid)
                         atomically $ modifyTVar st (M.insert tid info{tclientState = TCommited})
     goClean tid = atomically $ modifyTVar st (M.delete tid)
 
@@ -282,15 +282,23 @@ hack (Left e) = Just (Decline . S8.pack $! show e)
 hack (Right Nothing) = Nothing
 hack (Right (Just x)) = Just x
 
-encode' :: forall b . Binary b => b -> ByteString
-encode' = S.concat . SL.toChunks . encode
-{-# INLINE encode' #-}
-
-
 trySome :: IO a -> IO (Either SomeException a)
 trySome = try
 
 generateTID :: IO ByteString
 generateTID = MWC.withSystemRandom . MWC.asGenIO $ \gen ->
                     S.pack <$> replicateM 20 (MWC.uniform gen)
+
+decoding :: (Binary b) => (b -> IO (Maybe Action)) -> ByteString -> IO (Maybe Action)
+decoding f = maybe (return . Just $ Decline "unknown message") f . decodeMay' 
+
+encode' :: Binary b => b -> ByteString
+encode' = S.concat . SL.toChunks . encode
+{-# INLINE encode' #-}
+
+decodeMay' :: (Binary a) => ByteString -> Maybe a
+decodeMay' b =
+    case pushEndOfInput $ pushChunk (runGetIncremental get) b of
+      Done _ _  v -> return v
+      _ -> fail "no parse"
 
