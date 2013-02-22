@@ -23,7 +23,7 @@ module Network.TwoPhase
   , stmResult
   , cancel
   , timeout
-  , runServer
+  , runTxServer
   -- ** asynchronous api
   -- ** utils
   , decoding
@@ -345,11 +345,12 @@ timeout t a b c = do
 
 -- | Helper to run leader
 -- you can use this function is you can guarantee that this controller will always be a leader.
-runServer :: (TPStorage a, TPNetwork a, Ord (Addr a))
+runTxServer :: (TPStorage a, TPNetwork a, Ord (Addr a))
           => a
-          -> (IO (Addr a, ByteString)) 
-          -> IO ()
-runServer c feeder = forever $ feeder >>= \(a,b) -> withInput c a b (const . return . Just $ Decline "server")
+          -> IO (TChan (Addr a, ByteString), IO ())
+runTxServer c = do
+  ch <- newTChanIO
+  return (ch, forever $ (atomically $ readTChan ch) >>= \(a,b) -> withInput c a b (const . return . Just $ Decline "server"))
 
 
 {-

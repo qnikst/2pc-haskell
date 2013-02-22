@@ -18,7 +18,7 @@ import qualified Data.ByteString as S
 import Data.Maybe
 
 import Network.TwoPhase.STM
-import Network.TwoPhase
+import Network.TwoPhas
 
 main :: IO ()
 main = defaultMain tests
