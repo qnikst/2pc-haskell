@@ -1,13 +1,20 @@
 {-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings, DeriveDataTypeable #-}
 module Network.TwoPhase 
-  ( TPNetwork(..)
+  ( -- * Datatypes
+    TPNetwork(..)
   , TPStorage(..)
-  , withInput
-  , Action(..)
   , Storage(..)
   , mkStorage 
   -- * API
-  -- ** server
+  -- ** Basic API
+  -- $api
+  , withInput
+  -- *** Client
+  , Action(..)
+  , TEvent
+  , TCommit
+  , TRollback
+  -- ** Server
   -- $server
   , THandler
   , TransactionResult
@@ -18,10 +25,11 @@ module Network.TwoPhase
   , timeout
   , runServer
   -- ** asynchronous api
-  --, accept
-  --, decline
-  --, rollback
+  -- ** utils
   , decoding
+  -- , accept
+  -- , decline
+  --, rollback
   , module Control.Concurrent.STM.Split.TVar
   ) where
 
@@ -49,13 +57,18 @@ import Data.Set (Set)
 import qualified Data.Set as S
 import qualified System.Random.MWC as MWC
 
--- | TNetwork class abstracts network logic and
--- need to be defined to bind ThoPhase controller 
--- to the real network and can be sent over arbitrary
--- protocol
+-- | TNetwork class that abstracts network logic. You need to
+-- to define a 'send' function TwoPhase protocol message over
+-- you protocol.
+--
+-- Example of TPNetwork you may find in 'Network.TwoPhase.STMNetwork' module.
 class TPNetwork a where
   type Addr a
-  send :: a -> ByteString -> Addr a -> IO ()
+  -- ^ Address type, it can be any name or IP address depending on your protocol
+  send :: a -- ^ Controller
+       -> ByteString        -- ^ message data
+       -> Addr a            -- ^ recipient address
+       -> IO ()
 
 
 data TwoPhaseException = ERollback TID
@@ -103,7 +116,9 @@ type TResult x = SpTVar x (Maybe TransactionResult)
 -- | Transaction handler is used to control transaction flow on server
 data THandler = THandler !TID !(TResult Out)
 
-class (TPNetwork a) => TPStorage a where
+-- | Internal storage class internal storage should collect
+-- information about pending transactions avaliable at runtime
+class TPNetwork a => TPStorage a where
   getStore :: a -> Storage a
 
 -- | Transactional storage
@@ -112,6 +127,7 @@ data Storage a = Storage
         , storageCohort :: TVar (Map TID (TClientInfo a))
         }
 
+-- | initialize default STM storage
 mkStorage :: IO (Storage a)
 mkStorage = Storage <$> newTVarIO M.empty 
                     <*> newTVarIO M.empty
@@ -144,15 +160,19 @@ data TClientInfo a = TClientInfo
       }
 
 -- | User actions
-data Action = Decline ByteString
-            | Accept  TCommit TRollback
+data Action = Decline ByteString                        -- ^ cancel transaction with error message 
+            | Accept  TCommit TRollback                 -- ^ accept transaction and set commit and rollback messages
 
 
+-- | low level interface function. 
+--
+-- N.B. withInput is synchronous function untill you'll make it asynchronous
+-- explicitly see Asynchonous API section.
 withInput :: (TPNetwork a, TPStorage a, Ord (Addr a))
-          => a 
-          -> Addr a
-          -> ByteString 
-          -> TEvent ByteString
+          => a                                          -- ^ controller
+          -> Addr a                                     -- ^ sender address
+          -> ByteString                                 -- ^ message
+          -> TEvent ByteString                          -- ^ callback
           -> IO ()
 withInput a s b f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
@@ -331,9 +351,49 @@ runServer :: (TPStorage a, TPNetwork a, Ord (Addr a))
           -> IO ()
 runServer c feeder = forever $ feeder >>= \(a,b) -> withInput c a b (const . return . Just $ Decline "server")
 
+
+{-
+asynchonously = TID -> IO Action -> IO ()
+asynchonously t f = do
+  forkIO $ (do
+    x <- f
+    case x of
+      Accept -> accept t
+      Decline x -> decline t)
+    `onException` (\(e::SomeException) -> decline (S8.pack $ show e) >> 
+                                          throw e)
+  return Nothing
+-}
+
+-- $api 
+-- To use TwoPase in your program you need to capture messages as always
+-- and if you get TwoPhase Protocol message you need to pass it into 
+-- 'withInput' function, it's a general interface. 
+--
+
+
 -- $server
 -- Transaction leader can control transaction flow only by high level API:
 -- that gives an ability to create and cancel transactions. 
+
+-- $client
+--
+-- On client you will have 2 transaction steps first is voting step, where you 
+-- need to prepare transaction and either accept it or decline. If you declining
+-- transaction than you need manually undo all preparation steps, if you accepting
+-- you need to pass finalisation (commit) function and rollback function, rollback
+-- should support rollbacking after prepare when commit was not called, and rollback
+-- after commit.
+--
+-- For client by default all transactions a sequencial i.e. when you preparing 
+-- or commiting transaction thread that calls 'withInput' will be locked. To run
+-- transaction preparation asynchronously you need to call asynchronously.
+--
+
+
+
+
+
 
 
 hack :: Either SomeException (Maybe Action) -> Maybe Action
@@ -361,5 +421,3 @@ decodeMay' b =
       Done _ _  v -> return v
       _ -> fail "no parse"
 
-
--- |
