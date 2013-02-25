@@ -197,9 +197,7 @@ withInput a s b f =
     go (PRollback t) = do
         mv <- atomically $ M.lookup t <$> readTVar st
         case mv of
-          Nothing -> do
-              reply $ ackOk t
-              throw (ERollback t)
+          Nothing -> throw (ERollback t)
           Just info -> do
             case tclientState info of
               TVote -> goRollingBack t info
