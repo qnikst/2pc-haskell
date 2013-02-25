@@ -11,6 +11,7 @@ import Test.HUnit
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.IO.Class
 import Control.Concurrent
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
@@ -18,7 +19,7 @@ import qualified Data.ByteString as S
 import Data.Maybe
 
 import Network.TwoPhase.STM
-import Network.TwoPhas
+import Network.TwoPhase
 
 main :: IO ()
 main = defaultMain tests
@@ -106,10 +107,10 @@ runState net n (D s1 s2 r1 r2 r3) =
       Nothing -> error "!!"
       Just ch  -> forever $ do
         (s,m,_) <- atomically $ readTChan ch
-        withInput net s m $ \x -> if s1 then accept else decline
+        withInput net s m $ \tx x -> if s1 then accept' tx else decline' tx
   where
-    accept = atomically (writeTVar r1 (Just True)) >> return (Just (Accept commit rollback))
-    decline = atomically (writeTVar r1 (Just False)) >> return (Just (Decline "!!"))
+    accept'  tx = liftIO (atomically (writeTVar r1 (Just True))) >> accept tx commit rollback
+    decline' tx = liftIO (atomically (writeTVar r1 (Just False))) >> decline tx "!!"
     commit | s2 = atomically (writeTVar r2 (Just True))
            | otherwise = atomically (writeTVar r2 (Just False)) >> error "!!!"
     rollback = atomically (writeTVar r3 (Just True))
@@ -127,7 +128,7 @@ experiment ds = do
              Nothing -> error "no ch"
              Just ch  -> forever $ do
                 (s,m,_) <- atomically (readTChan ch)
-                withInput net s m (const $ return Nothing)
+                withInput net s m (\_ _ -> return ())
     x <- waitResult t
     mapM_ (const yield) ls
     mapM_ killThread ls
@@ -143,14 +144,14 @@ testTimeout ret = do
                                         Nothing -> return ()
                                         Just ch -> forever $ do
                                           (s,m,_) <- atomically $ readTChan ch
-                                          withInput com' s m (const . return . Just $ Accept (return ()) (return ()))
+                                          withInput com' s m (\x _ -> accept x (return ()) (return ()))
   t <- registerDelay 500000
   _ <- forkIO $ do
          case extractCh com "main" of
              Nothing -> return ()
              Just ch  -> forever $ do
                 (s,m,_) <- atomically (readTChan ch)
-                withInput com s m (const $ return Nothing)
+                withInput com s m (\_ _ -> return ())
   r <- atomically $ (stmResult a) `orElse`
                        (readTVar t 
                         >>= flip unless retry 

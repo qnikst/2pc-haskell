@@ -1,6 +1,8 @@
-{-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings, DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes, TypeFamilies, FlexibleContexts, OverloadedStrings, DeriveDataTypeable, ScopedTypeVariables #-}
 module Network.TwoPhase 
-  ( -- * Datatypes
+  ( 
+  -- $intro
+  -- * Network
     TPNetwork(..)
   , TPStorage(..)
   , Storage(..)
@@ -10,27 +12,28 @@ module Network.TwoPhase
   -- $api
   , withInput
   -- *** Client
-  , Action(..)
-  , TEvent
+  , VoteHandler
   , TCommit
   , TRollback
-  -- ** Server
+  , accept
+  , decline
+  , cleanup
+  -- *** Server
   -- $server
+  , transaction
   , THandler
   , TransactionResult
-  , transaction
   , waitResult
   , stmResult
   , cancel
   , timeout
+  , cleanupS
   , runTxServer
-  -- ** asynchronous api
   -- ** utils
   , decoding
-  -- , accept
-  -- , decline
   --, rollback
   , module Control.Concurrent.STM.Split.TVar
+  , module Control.Monad.Trans.Resource
   ) where
 
 import Prelude hiding (sequence, mapM_)
@@ -38,10 +41,11 @@ import Control.Applicative
 import Control.Concurrent.STM
 import Control.Concurrent.STM.Split.TVar
 import Control.Concurrent.STM.Split.Class
-import Control.Exception
-import Control.Monad (replicateM, (<=<), unless, forever)
+import Control.Exception.Lifted
+import Control.Monad (replicateM, (<=<), unless, forever, when)
 import Control.Monad.Error (Error())
 import Control.Monad.Trans
+import Control.Monad.Trans.Resource
 import Control.Monad.Trans.Either
 import Data.Binary
 import Data.Binary.Get
@@ -53,6 +57,7 @@ import Data.Foldable (mapM_, forM_)
 import Data.Typeable
 import Data.Map (Map)
 import qualified Data.Map as M
+import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as S
 import qualified System.Random.MWC as MWC
@@ -65,9 +70,9 @@ import qualified System.Random.MWC as MWC
 class TPNetwork a where
   type Addr a
   -- ^ Address type, it can be any name or IP address depending on your protocol
-  send :: a -- ^ Controller
-       -> ByteString        -- ^ message data
-       -> Addr a            -- ^ recipient address
+  send :: a                 -- ^ Network controller
+       -> ByteString        -- ^ Message data
+       -> Addr a            -- ^ Recipient address
        -> IO ()
 
 
@@ -83,6 +88,7 @@ data Protocol = PNewTransaction TID ByteString                                  
               | PCommit  TID                                                        -- ^ commit message
               | PRollback TID -- ^ rollback message
               | PAck TID (Either ByteString ())   -- ^ ack message
+              | PCleanup TID
               deriving (Show)
 
 ackOk :: TID -> Protocol
@@ -96,12 +102,14 @@ instance Binary Protocol where
   put (PCommit t) = putWord8 1 >> put t
   put (PRollback t) = putWord8 2 >> put t
   put (PAck t v) = putWord8 3 >> put t >> put v
+  put (PCleanup t) = putWord8 4 >> put t
   get = do t <- get :: Get Word8
            case t of
              0 -> PNewTransaction <$> get <*> get
              1 -> PCommit <$> get
              2 -> PRollback <$> get
              3 -> PAck <$> get <*> get
+             4 -> PCleanup <$> get
              _ -> error "Protocol.get"
 
 -- | Transaction ID
@@ -109,12 +117,17 @@ type TID = ByteString
 type TransactionResult = Either TErrors ()
 type TRollback = IO ()
 type TCommit   = IO ()
-type TEvent  a = a -> IO (Maybe Action)
 type TErrors   = [ByteString]
 type TResult x = SpTVar x (Maybe TransactionResult)
 
 -- | Transaction handler is used to control transaction flow on server
 data THandler = THandler !TID !(TResult Out)
+
+-- | Transaction handler that used to either accept or rollback 
+-- transaction.
+data VoteHandler = VoteHandler !(TMVar Bool) 
+                               !(TCommit -> TRollback -> IO ())
+                               !(ByteString -> IO ())
 
 -- | Internal storage class internal storage should collect
 -- information about pending transactions avaliable at runtime
@@ -157,22 +170,22 @@ data TClientInfo a = TClientInfo
       , tcommit      :: TCommit                               -- ^ commit action
       , trollback    :: TRollback                             -- ^ rollback action
       , tcsender     :: Addr a
+      , tcdata       :: ByteString
       }
-
--- | User actions
-data Action = Decline ByteString                        -- ^ cancel transaction with error message 
-            | Accept  TCommit TRollback                 -- ^ accept transaction and set commit and rollback messages
-
 
 -- | low level interface function. 
 --
--- N.B. withInput is synchronous function untill you'll make it asynchronous
--- explicitly see Asynchonous API section.
-withInput :: (TPNetwork a, TPStorage a, Ord (Addr a))
-          => a                                          -- ^ controller
-          -> Addr a                                     -- ^ sender address
-          -> ByteString                                 -- ^ message
-          -> TEvent ByteString                          -- ^ callback
+-- Callback client is a function that will be called once new transaction will
+-- arive (i.e. server doesn't need it). When user work with function he should
+-- either 'accept' or 'decline' transaction, if none will be done trasaction 
+-- will be declined, if you want to run that function asynchonously you should
+-- run it in 'resourceForkIO', that will prevent transaction from declining until
+-- this thread will be finished.
+withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Binary b)
+          => a                                          -- ^ Network controller
+          -> Addr a                                     -- ^ Sender address
+          -> ByteString                                 -- ^ Message
+          -> (VoteHandler -> b -> ResourceT IO ())      -- ^ Callback
           -> IO ()
 withInput a s b f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
@@ -244,17 +257,29 @@ withInput a s b f =
                                        else (PRollback, TRollingback)
                   in do atomically $ modifyTVar ct (M.insert tid i{tstate = s, tawait = tparty i})
                         mapM_ (send a (encode' $ m tid)) (tparty i)
-
+    go (PCleanup t) = atomically $ do
+          mtr <- M.lookup t <$> readTVar st
+          case mtr of
+            Nothing -> return ()
+            Just tr -> modifyTVar st (M.delete t)
 
     -- State blocks
-    goInitialize tid dat_ = do
-        ev <- hack <$> (try $! f dat_)
-        case ev of
-          Nothing -> return () -- just ignore
-          Just (Decline e) -> reply (ackNo tid e)
-          Just (Accept commit rollback) -> do
-            atomically $ modifyTVar st (M.insert tid (TClientInfo TVote commit rollback s))
-            reply $! ackOk tid
+    goInitialize tid dat_ = 
+        case decodeMay' dat_ of
+          Nothing -> reply (ackNo tid ("no-parse"::ByteString))
+          Just d  -> runResourceT $ do
+               lock    <- liftIO $ newTMVarIO False
+               (_,res) <- allocate (return $ VoteHandler lock
+                                          (\cm rb -> do 
+                                              atomically $ modifyTVar st (M.insert tid (TClientInfo TVote cm rb s dat_))
+                                              reply $! ackOk tid)
+                                          (reply . (ackNo tid)))
+                                (releaseTHandler)
+               ev <- try $! f res d
+               case ev of
+                  Left (e::SomeException)  -> decline res (S8.pack $ show e)
+                  Right _ -> return ()
+
     -- client rolling back block
     goRollingBack tid info = do 
         atomically $ modifyTVar st (M.insert tid info{tclientState = TRollingback}) -- TODO adjust (?)
@@ -324,6 +349,20 @@ cancel a (THandler t _) = runEitherT $ do -- TODO use goRollbackingS function
       forM_ (tparty x) $ \r -> send a (encode' (PRollback t)) r
   where ct = storageLeader . getStore $ a
 
+-- | Send a command to clean up current transaction
+-- transaction should be finished otherwise nothing will be done
+cleanupS :: (TPNetwork a) => a -> THandler -> [Addr a] -> IO Bool
+cleanupS a (THandler t s) adx = do
+    x <- atomically (readSpTVar s)
+    when (isJust x) (mapM_ (send a (encode' (PCleanup t))) adx)
+    return $! isJust x
+
+-- | Cleanup on client
+-- N.B. this function doesn't perform any changes on transaction
+cleanup :: (TPNetwork a, TPStorage a, Binary b) => a -> b -> IO ()
+cleanup a b = atomically $ modifyTVar st (M.filter (((encode' b)==).tcdata) )
+  where st = storageCohort (getStore a)
+
 -- | create transaction with timeout, this is operation will be locked untill it completes
 -- note require -threaded, see 'Control.Concurrent.STM.TVar' registerDelay
 timeout :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) 
@@ -348,27 +387,61 @@ runTxServer :: (TPStorage a, TPNetwork a, Ord (Addr a))
           -> IO (TChan (Addr a, ByteString), IO ())
 runTxServer c = do
   ch <- newTChanIO
-  return (ch, forever $ (atomically $ readTChan ch) >>= \(a,b) -> withInput c a b (const . return . Just $ Decline "server"))
+  return (ch, forever $ (atomically $ readTChan ch) >>= \(a,b) -> withInput c a b (\_ (_::ByteString) -> return ()))
 
 
-{-
-asynchonously = TID -> IO Action -> IO ()
-asynchonously t f = do
-  forkIO $ (do
-    x <- f
-    case x of
-      Accept -> accept t
-      Decline x -> decline t)
-    `onException` (\(e::SomeException) -> decline (S8.pack $ show e) >> 
-                                          throw e)
-  return Nothing
--}
+-- $intro
+-- Two phase commit protocol (2PC) is an atomic commitement protocol. It uses 
+-- distributed algorithm that allow to run atomic trasactions on a different
+-- hosts.
+--
+-- Algorithm consists of two parts: 
+--
+--    * voting phase
+--    
+--    * commit phase
+--
+-- In voting phase every node is notified about incomming transaction and each
+-- node should prepare transaction: i.e. change it state, check if transaction 
+-- is able to run and then either accept or decline transaction.  When node is
+-- accepting transaction it should provide commit and rollback actoins that will
+-- be automatically triggered when transaction will change state.
+--
+-- When all nodes sent their vote leader either commit transaction (if everybody
+-- accepted) or send a rollback event. So when client receive a new event it 
+-- triggeres action. And then either commit if there was no exceptions or rollback
+-- transaction. So transaction can be rolled back even after commit message.
+--
+-- Problems:
+--
+--    1. If transaction succesfully aplied then node will never know that every other nodes
+--    finished also finished this transaction, so you have to store rollback function
+--    forever, and it is a possible memleak. To prevent system from a memleak there
+--    is a cleanup API: 'cleanupS' for transaction leader and 'cleanup' for client.
+--
+--    2. The library itself doesn't support methods checking concurrent transaction, i.e. 
+--    library can't say if current recipient is in transaction now. This is needed because
+--    each node can has many indenendent transactions. So user should provide state check
+--    in prepare function (in vote phase)
+--
+--    3. There is a time perion when system is not in consistent state: when done finishes
+--    transaction it doesn't know if all transaction is finished, and if request need
+--    all nodes to be in consistent state you need to either call it in 2pc transaction
+--    or introduce mechanism to notify nodes about transaction finish.
+--
+-- This library is network agnosting this means that you can use 2pc over your
+-- protocol my writing a "wrapper" with specified 'send' function.
 
 -- $api 
--- To use TwoPase in your program you need to capture messages as always
--- and if you get TwoPhase Protocol message you need to pass it into 
--- 'withInput' function, it's a general interface. 
+-- To use TwoPase in your program you need to capture messages message outside of
+-- 2pc and then feed it into 'withInput' a general library interface. This should
+-- be done as for server (leader only node) and for clients.
 --
+-- WithInput is not asynchronous, so process will be locked until internal action 
+-- (i.e. phase action) will be finished. So it can be a bottleneck, however you
+-- can use resourceForkIO to jump form the action. This should be done carefully
+-- as if you will try to commit asynchronously you can receive rollback message
+-- while you are commiting. (TODO fix it)
 
 
 -- $server
@@ -389,17 +462,6 @@ asynchonously t f = do
 -- transaction preparation asynchronously you need to call asynchronously.
 --
 
-
-
-
-
-
-
-hack :: Either SomeException (Maybe Action) -> Maybe Action
-hack (Left e) = Just (Decline . S8.pack $! show e)
-hack (Right Nothing) = Nothing
-hack (Right (Just x)) = Just x
-
 trySome :: IO a -> IO (Either SomeException a)
 trySome = try
 
@@ -407,8 +469,8 @@ generateTID :: IO ByteString
 generateTID = MWC.withSystemRandom . MWC.asGenIO $ \gen ->
                     S.pack <$> replicateM 20 (MWC.uniform gen)
 
-decoding :: (Binary b) => (b -> IO (Maybe Action)) -> ByteString -> IO (Maybe Action)
-decoding f = maybe (return . Just $ Decline "unknown message") f . decodeMay' 
+decoding :: (MonadIO m, Binary b) => (VoteHandler -> b -> m ()) -> VoteHandler -> ByteString -> m ()
+decoding f v = maybe (decline v "unknown message") (f v) . decodeMay' 
 
 encode' :: Binary b => b -> ByteString
 encode' = S.concat . SL.toChunks . encode
@@ -420,3 +482,25 @@ decodeMay' b =
       Done _ _  v -> return v
       _ -> fail "no parse"
 
+releaseTHandler :: VoteHandler -> IO ()
+releaseTHandler (VoteHandler lock _apply c) = do
+    lc <- atomically $ takeTMVar lock
+    unless lc (c "No responce")
+
+decline :: MonadIO m 
+        => VoteHandler    -- ^ transaction 
+        -> ByteString     -- ^ message
+        -> m ()
+decline (VoteHandler lock _apply cancel') bs = liftIO $ do
+    lc <- atomically $ takeTMVar lock
+    unless lc (cancel' bs >> atomically (putTMVar lock True))
+
+-- | accept transaction 
+accept :: MonadIO m 
+        => VoteHandler -- ^ transaction handler
+        -> TCommit     -- ^ commit action
+        -> TRollback   -- ^ rollback action
+        -> m ()
+accept (VoteHandler lock apply _cancel) commit rollback = liftIO $ do
+    lc <- atomically $ takeTMVar lock
+    unless lc (apply commit rollback >> atomically (putTMVar lock True))
