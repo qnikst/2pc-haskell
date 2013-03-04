@@ -20,7 +20,7 @@ library
   -- other-modules:       
   build-depends:       base ==4.6.*,
                        stm ==2.4.*,
-                       binary ==0.6.*,
+                       binary >=0.5 && <0.8,
                        bytestring ==0.10.*,
                        containers ==0.5.*,
                        mtl,

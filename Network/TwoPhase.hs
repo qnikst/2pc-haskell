@@ -261,7 +261,7 @@ withInput a s b f =
           mtr <- M.lookup t <$> readTVar st
           case mtr of
             Nothing -> return ()
-            Just tr -> modifyTVar st (M.delete t)
+            Just _ -> modifyTVar st (M.delete t)
 
     -- State blocks
     goInitialize tid dat_ = 
