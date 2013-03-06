@@ -185,7 +185,7 @@ withInput :: (TPNetwork a, TPStorage a, Ord (Addr a), Binary b)
           => a                                          -- ^ Network controller
           -> Addr a                                     -- ^ Sender address
           -> ByteString                                 -- ^ Message
-          -> (VoteHandler -> b -> ResourceT IO ())      -- ^ Callback
+          -> ((ReleaseKey, VoteHandler) -> b -> ResourceT IO ())      -- ^ Callback
           -> IO ()
 withInput a s b f = 
     let ev = pushEndOfInput $ pushChunk (runGetIncremental get) b
@@ -268,8 +268,8 @@ withInput a s b f =
         case decodeMay' dat_ of
           Nothing -> reply (ackNo tid ("no-parse"::ByteString))
           Just d  -> runResourceT $ do
-               lock    <- liftIO $ newTMVarIO False
-               (_,res) <- allocate (return $ VoteHandler lock
+               lock <- liftIO $ newTMVarIO False
+               res  <- allocate (return $ VoteHandler lock
                                           (\cm rb -> do 
                                               atomically $ modifyTVar st (M.insert tid (TClientInfo TVote cm rb s dat_))
                                               reply $! ackOk tid)
@@ -277,7 +277,7 @@ withInput a s b f =
                                 (releaseTHandler)
                ev <- try $! f res d
                case ev of
-                  Left (e::SomeException)  -> decline res (S8.pack $ show e)
+                  Left (e::SomeException)  -> decline (snd res) (S8.pack $ show e)
                   Right _ -> return ()
 
     -- client rolling back block
