@@ -163,6 +163,7 @@ data TServerInfo a = TServerInfo
       , tdata        :: !ByteString
       , tresult      :: ![ByteString]
       , result       :: TResult In
+      , action       :: Bool -> IO ()
       }
 
 data TClientInfo a = TClientInfo 
@@ -257,6 +258,7 @@ withInput a s b f =
                                        else (PRollback, TRollingback)
                   in do atomically $ modifyTVar ct (M.insert tid i{tstate = s, tawait = tparty i})
                         mapM_ (send a (encode' $ m tid)) (tparty i)
+                        action i state
     go (PCleanup t) = atomically $ do
           mtr <- M.lookup t <$> readTVar st
           case mtr of
@@ -306,12 +308,13 @@ withInput a s b f =
 transaction :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a)) 
             => a -- ^ transaction controller 
             -> d -- ^ event 
+            -> (Bool -> IO ())   -- ^ event to perform when all partipitians accepted transaction
             -> [Addr a]  -- ^ list of partipitiants
             -> IO THandler
-transaction a d rs = do
+transaction a d f rs = do
     tid <- generateTID
     (inBox, outBox) <- splitTVar <$> newTVarIO Nothing
-    let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] inBox
+    let info = TServerInfo TVote (S.fromList rs) (S.fromList rs) db [] inBox f
     atomically $ modifyTVar st (M.insert tid info)
     forM_ rs $ \r -> send a (encode' (PNewTransaction tid db)) r
     return (THandler tid outBox)
@@ -369,10 +372,11 @@ timeout :: (TPStorage a, TPNetwork a, Binary d, Ord (Addr a))
         => Int 
         -> a 
         -> d 
+        -> (Bool -> IO ())
         -> [Addr a] 
         -> IO (Maybe TransactionResult)
-timeout t a b c = do
-  h <- transaction a b c
+timeout t a b f c = do
+  h <- transaction a b f c
   d <- registerDelay t
   mr <- atomically $ (Just <$> stmResult h)
            `orElse` (readTVar d >>= flip unless retry >> return Nothing)

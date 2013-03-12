@@ -1,5 +1,5 @@
 name:                2pc
-version:             0.0.3
+version:             0.0.4
 synopsis:            protocol agnostic two phase commit implementation
 description:         Two phase protocol is a protocol to perform synchonized
                      actions in distributed systems. This implementation is
