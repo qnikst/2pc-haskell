@@ -490,6 +490,7 @@ releaseTHandler :: VoteHandler -> IO ()
 releaseTHandler (VoteHandler lock _apply c) = do
     lc <- atomically $ takeTMVar lock
     unless lc (c "No responce")
+    atomically $ putTMVar lock True
 
 decline :: MonadIO m 
         => VoteHandler    -- ^ transaction 
@@ -497,8 +498,8 @@ decline :: MonadIO m
         -> m ()
 decline (VoteHandler lock _apply cancel') bs = liftIO $ do
     lc <- atomically $ takeTMVar lock
-    unless lc (cancel' bs >> atomically (putTMVar lock True))
-
+    unless lc (cancel' bs)
+    atomically (putTMVar lock True)
 -- | accept transaction 
 accept :: MonadIO m 
         => VoteHandler -- ^ transaction handler
@@ -507,4 +508,5 @@ accept :: MonadIO m
         -> m ()
 accept (VoteHandler lock apply _cancel) commit rollback = liftIO $ do
     lc <- atomically $ takeTMVar lock
-    unless lc (apply commit rollback >> atomically (putTMVar lock True))
+    unless lc (apply commit rollback)
+    atomically (putTMVar lock True)
