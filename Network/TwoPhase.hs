@@ -216,6 +216,7 @@ withInput a s b f =
             case tclientState info of
               TVote -> goRollingBack t info
               TCommited  -> goRollingBack t info
+              TCommiting -> atomically $ modifyTVar st  (M.insert t info{tclientState = TRollingback})
               TRollback -> reply (ackOk t)
               _ -> return () {- ? -}
     go (PAck tid retData) = do
@@ -296,11 +297,20 @@ withInput a s b f =
     goCommiting tid info = do
         atomically $ modifyTVar st (M.insert tid info{tclientState = TCommiting})
         ret <- trySome (tcommit info)
-        case ret of
-          Left e -> do reply (PAck tid . Left . S8.pack $ show e)
-                       goRollingBack tid info
-          Right _ -> do reply (ackOk tid)
-                        atomically $ modifyTVar st (M.insert tid info{tclientState = TCommited})
+        minfo <- M.lookup tid <$> readTVarIO st
+        case tclientState <$> minfo of 
+          Nothing -> do 
+            reply (PAck tid . Left . S8.pack $ "incorrect state")
+            goRollingBack tid info
+          Just TCommiting ->
+            case ret of
+              Left e -> do 
+                reply (PAck tid . Left . S8.pack $ show e)
+                goRollingBack tid info
+              Right _ -> do 
+                reply (ackOk tid)
+                atomically $ modifyTVar st (M.insert tid info{tclientState = TCommited})
+          Just TRollingback -> goRollingBack tid info
     goClean tid = atomically $ modifyTVar st (M.delete tid)
 
             
