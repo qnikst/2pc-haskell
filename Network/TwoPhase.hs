@@ -499,7 +499,7 @@ decodeMay' b =
 releaseTHandler :: VoteHandler -> IO ()
 releaseTHandler (VoteHandler lock _apply c) = do
     lc <- atomically $ takeTMVar lock
-    unless lc (c "No responce")
+    unless lc  $ c "No response"
     atomically $ putTMVar lock True
 
 decline :: MonadIO m 
